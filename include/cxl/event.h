@@ -161,7 +161,7 @@ struct cxl_extent_list_node {
 
 /*
  * Dynamic Capacity Event Record
- * CXL rev 3.1 section 8.2.9.2.1.6; Table 8-50
+ * CXL r4.0 section 8.2.10.2.1.6; Table 8-229
  */
 #define CXL_DCD_EVENT_MORE			BIT(0)
 struct cxl_event_dcd {
@@ -169,7 +169,7 @@ struct cxl_event_dcd {
 	u8 event_type;
 	u8 validity_flags;
 	__le16 host_id;
-	u8 partition_index;
+	u8 updated_region_index;
 	u8 flags;
 	u8 reserved1[0x2];
 	struct cxl_extent extent;
