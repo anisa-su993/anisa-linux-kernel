@@ -269,6 +269,22 @@ int cxl_trigger_poison_list(struct cxl_memdev *cxlmd)
 }
 EXPORT_SYMBOL_NS_GPL(cxl_trigger_poison_list, "CXL");
 
+/* Read cxlmd->cxlds under cxl_memdev_rwsem to serialize against teardown */
+int cxled_dcd_check(struct cxl_endpoint_decoder *cxled)
+{
+	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+	struct cxl_dev_state *cxlds;
+
+	guard(rwsem_read)(&cxl_memdev_rwsem);
+	cxlds = cxlmd->cxlds;
+	if (!cxlds || cxlds->type != CXL_DEVTYPE_CLASSMEM)
+		return -ENODEV;
+	if (!cxl_dcd_supported(to_cxl_memdev_state(cxlds)))
+		return -EINVAL;
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxled_dcd_check, "CXL");
+
 static int cxl_validate_poison_dpa(struct cxl_memdev *cxlmd, u64 dpa)
 {
 	struct cxl_dev_state *cxlds = cxlmd->cxlds;
