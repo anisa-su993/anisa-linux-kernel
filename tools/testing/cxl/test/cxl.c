@@ -1445,6 +1445,18 @@ static void mock_cxl_endpoint_parse_cdat(struct cxl_port *port)
 		};
 
 		dpa_perf_setup(port, &range, perf);
+
+		/*
+		 * The mock probe stamps MOCK_DC_SHARABLE_SERIAL onto exactly
+		 * one cxl_mem instance; mark its DC partition sharable so
+		 * cxl_validate_extent() routes shared-seq injects through
+		 * the sharable regime.  Every other memdev keeps its DC
+		 * partition non-sharable so the existing untagged / seq=0
+		 * tests still run on this kernel.
+		 */
+		if (cxlds->part[i].mode == CXL_PARTMODE_DYNAMIC_RAM_1 &&
+		    cxlds->serial == MOCK_DC_SHARABLE_SERIAL)
+			cxlds->part[i].shareable = true;
 	}
 
 	cxl_memdev_update_perf(cxlmd);
