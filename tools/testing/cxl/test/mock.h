@@ -5,6 +5,15 @@
 #include <linux/dax.h>
 #include <cxl.h>
 
+/*
+ * Mock serial sentinel.  The cxl_mock_mem probe stamps this serial on
+ * exactly one platform device (cxl_mem with id 0); that single memdev's
+ * DC partition is marked sharable in mock_cxl_endpoint_parse_cdat() so
+ * the suite can exercise sharable-extent code paths without losing the
+ * non-sharable coverage on the other mock memdevs.
+ */
+#define MOCK_DC_SHARABLE_SERIAL 0xDCDCULL
+
 struct cxl_mock_ops {
 	struct list_head list;
 	bool (*is_mock_adev)(struct acpi_device *dev);
