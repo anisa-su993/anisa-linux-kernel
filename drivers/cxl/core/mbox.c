@@ -5,6 +5,8 @@
 #include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/unaligned.h>
+#include <linux/list.h>
+#include <linux/list_sort.h>
 #include <cxlpci.h>
 #include <cxlmem.h>
 #include <cxl.h>
@@ -929,6 +931,74 @@ out:
 }
 EXPORT_SYMBOL_NS_GPL(cxl_enumerate_cmds, "CXL");
 
+static int cxl_validate_extent_partition(struct cxl_memdev_state *mds,
+						struct cxl_extent *extent,
+						struct range *ext_range)
+{
+	struct cxl_dev_state *cxlds = &mds->cxlds;
+	struct device *dev = mds->cxlds.dev;
+
+	/* Extents must be within the DC partition boundary */
+	for (int i = 0; i < cxlds->nr_partitions; i++) {
+		struct cxl_dpa_partition *part = &cxlds->part[i];
+		struct range partition_range = {
+			.start = part->res.start,
+			.end = part->res.end,
+		};
+
+		if (part->mode != CXL_PARTMODE_DYNAMIC_RAM_A)
+			continue;
+
+		if (range_contains(&partition_range, ext_range)) {
+			dev_dbg(dev, "DC extent DPA %pra (DCR:%pra)(%pU)\n",
+				&ext_range, &partition_range, extent->uuid);
+			return 0;
+		}
+	}
+
+	dev_err_ratelimited(dev,
+			    "DC extent DPA %pra (%pU) is not in a valid DC partition\n",
+			    &ext_range, extent->uuid);
+	return -ENXIO;
+}
+
+/*
+ * Check extent tag is non-null, tag is not already in use, extent belongs to a
+ * region, and the extent is within the bounds of a DC partition.
+ * If extent is not first in the pending_list, check tag and region match the
+ * previous entry's.
+ *
+ */
+static int cxl_validate_extent(struct cxl_memdev_state *mds,
+			       struct cxl_extent_list_node *pos)
+{
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent *extent = pos->extent;
+	struct range ext_range = (struct range) {
+		.start = le64_to_cpu(extent->start_dpa),
+		.end = le64_to_cpu(extent->start_dpa) +
+			le64_to_cpu(extent->length) - 1,
+	};
+	uuid_t *uuid = (uuid_t *)extent->uuid;
+
+	if (uuid_is_null(uuid)) {
+		dev_dbg(dev, "no tag for extent: %pra\n", &ext_range);
+		return -EINVAL;
+	}
+
+	if (le16_to_cpu(extent->shared_extn_seq) != 0) {
+		dev_dbg(dev,
+			"DC extent DPA %pra (%pU) can not be shared\n",
+			&ext_range, uuid);
+		return -ENXIO;
+	}
+
+	if (cxl_validate_extent_partition(mds, extent, &ext_range))
+		return -ENXIO;
+
+	return 0;
+}
+
 void cxl_event_trace_record(const struct cxl_memdev *cxlmd,
 			    enum cxl_event_log_type type,
 			    enum cxl_event_type event_type,
@@ -1094,6 +1164,324 @@ free_pl:
 	return rc;
 }
 
+static int send_one_response(struct cxl_mailbox *cxl_mbox,
+			     struct cxl_mbox_dc_response *response,
+			     int opcode, u32 extent_list_size, u8 flags)
+{
+	struct cxl_mbox_cmd mbox_cmd = (struct cxl_mbox_cmd) {
+		.opcode = opcode,
+		.size_in = struct_size(response, extent_list, extent_list_size),
+		.payload_in = response,
+	};
+
+	response->extent_list_size = cpu_to_le32(extent_list_size);
+	response->flags = flags;
+	return cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
+}
+
+static int cxl_send_dc_response(struct cxl_memdev_state *mds, int opcode,
+				struct list_head *extent_list, int cnt)
+{
+	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+	struct cxl_mbox_dc_response *p;
+	struct cxl_extent_list_node *pos, *tmp;
+	struct cxl_extent *extent;
+	u32 pl_index;
+
+	size_t pl_size = struct_size(p, extent_list, cnt);
+	u32 max_extents = cnt;
+
+	/* May have to use more bit on response. */
+	if (pl_size > cxl_mbox->payload_size) {
+		max_extents = (cxl_mbox->payload_size - sizeof(*p)) /
+			      sizeof(struct updated_extent_list);
+		pl_size = struct_size(p, extent_list, max_extents);
+	}
+
+	struct cxl_mbox_dc_response *response __free(kfree) =
+						kzalloc(pl_size, GFP_KERNEL);
+	if (!response)
+		return -ENOMEM;
+
+	if (cnt == 0)
+		return send_one_response(cxl_mbox, response, opcode, 0, 0);
+
+	pl_index = 0;
+	list_for_each_entry_safe(pos, tmp, extent_list, list) {
+		extent = pos->extent;
+		response->extent_list[pl_index].dpa_start = extent->start_dpa;
+		response->extent_list[pl_index].length = extent->length;
+		pl_index++;
+
+		if (pl_index == max_extents) {
+			u8 flags = 0;
+			int rc;
+
+			if (pl_index < cnt)
+				flags |= CXL_DCD_EVENT_MORE;
+			rc = send_one_response(cxl_mbox, response, opcode,
+					       pl_index, flags);
+			if (rc)
+				return rc;
+			cnt -= pl_index;
+			if (cnt < max_extents)
+				max_extents = cnt;
+			pl_index = 0;
+		}
+	}
+
+	if (!pl_index) /* nothing more to do */
+		return 0;
+	return send_one_response(cxl_mbox, response, opcode, pl_index, 0);
+}
+
+static void delete_extent_node(struct cxl_extent_list_node *node)
+{
+	list_del(&node->list);
+	kfree(node->extent);
+	kfree(node);
+}
+
+void memdev_release_extent(struct cxl_memdev_state *mds, struct range *range)
+{
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent_list_node *node;
+	LIST_HEAD(extent_list);
+
+	dev_dbg(dev, "Release response dpa %pra\n", range);
+
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return;
+
+	node->extent = kzalloc(sizeof(*node->extent), GFP_KERNEL);
+	if (!node->extent) {
+		kfree(node);
+		return;
+	}
+
+	node->extent->start_dpa = cpu_to_le64(range->start);
+	node->extent->length = cpu_to_le64(range_len(range));
+	list_add_tail(&node->list, &extent_list);
+
+	if (cxl_send_dc_response(mds, CXL_MBOX_OP_RELEASE_DC, &extent_list, 1))
+		dev_dbg(dev, "Failed to release %pra\n", range);
+
+	delete_extent_node(node);
+}
+
+static void clear_pending_extents(void *_mds)
+{
+	struct cxl_memdev_state *mds = _mds;
+	struct cxl_extent_list_node *pos, *tmp;
+
+	list_for_each_entry_safe(pos, tmp, &mds->add_ctx.pending_extents, list) {
+                delete_extent_node(pos);
+        }
+	mds->add_ctx.region_extent = NULL;
+}
+
+static int dpa_compare(void *priv,
+		       const struct list_head *a,
+		       const struct list_head *b)
+{
+	const struct cxl_extent_list_node *ea =
+		list_entry(a, struct cxl_extent_list_node, list);
+	const struct cxl_extent_list_node *eb =
+		list_entry(b, struct cxl_extent_list_node, list);
+
+	if (ea->extent->start_dpa < eb->extent->start_dpa)
+		return -1;
+	if (ea->extent->start_dpa > eb->extent->start_dpa)
+		return 1;
+
+	return 0;
+}
+
+static int idx_compare(void *priv,
+		       const struct list_head *a,
+		       const struct list_head *b)
+{
+	const struct cxl_extent_list_node *ea =
+		list_entry(a, struct cxl_extent_list_node, list);
+	const struct cxl_extent_list_node *eb =
+		list_entry(b, struct cxl_extent_list_node, list);
+
+	if (ea->idx < eb->idx)
+		return -1;
+	if (ea->idx > eb->idx)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Validate and add contiguous extents. Removes invalid, non-contiguous, or
+ * mismatched extents from pending_list. Sorts by DPA for processing, then
+ * restores original order for response.
+ */
+static int cxl_add_pending(struct cxl_memdev_state *mds)
+{
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent_list_node *pos, *tmp;
+	struct region_extent *pending_reg_ext;
+	struct cxl_extent *extent;
+	u64 prev_end, start, len;
+	int cnt = 0, rc;
+
+	list_sort(NULL, &mds->add_ctx.pending_extents, dpa_compare);
+	list_for_each_entry_safe(pos, tmp, &mds->add_ctx.pending_extents, list) {
+		extent = pos->extent;
+		start = le64_to_cpu(extent->start_dpa);
+		len = le64_to_cpu(extent->length);
+
+		/* Start enforcing contiguity after accepting first extent */
+		if (cnt && start != prev_end) {
+			dev_dbg(dev,
+				"Non-contiguous extent DPA:%#llx LEN:%#llx\n",
+				start, len);
+			delete_extent_node(pos);
+			continue;
+		}
+
+		if (cxl_validate_extent(mds, pos)) {
+			delete_extent_node(pos);
+			continue;
+		}
+
+		if (cxl_add_extent(mds, extent)) {
+			dev_dbg(dev,
+				"Failed to add extent DPA:%#llx LEN:%#llx\n",
+				start, len);
+			delete_extent_node(pos);
+			continue;
+		}
+
+		prev_end = start + len;
+		cnt++;
+	}
+
+	if (!mds->add_ctx.region_extent) {
+		dev_dbg(dev, "No valid extents in list; accept none\n");
+		return 0;
+	}
+
+	pending_reg_ext = mds->add_ctx.region_extent;
+
+	/* device model handles freeing region_extent */
+	rc = online_region_extent(mds->add_ctx.region_extent);
+	if (rc)
+		return rc;
+
+	/* Restore remaining extents to original order and send rsp */
+	list_sort(NULL, &mds->add_ctx.pending_extents, idx_compare);
+	return cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
+				    &mds->add_ctx.pending_extents, cnt);
+}
+
+static int add_to_pending_list(struct list_head *pending_list,
+			       struct cxl_extent *to_add)
+{
+	struct cxl_extent_list_node *node, *prev;
+	struct cxl_extent *extent;
+
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+	extent = kmemdup(to_add, sizeof(*extent), GFP_KERNEL);
+	if (!extent)
+		return -ENOMEM;
+
+	node->extent = extent;
+	list_add_tail(&node->list, pending_list);
+
+	/*
+	 * List is sorted by DPA when adding. Save original index to restore
+	 * order when sending DC rsp, as required by the spec.
+	 */
+	if (list_is_first(&node->list, pending_list)) {
+		node->idx = 0;
+	} else {
+		prev = list_prev_entry(node, list);
+		node->idx = prev->idx + 1;
+	}
+
+	return 0;
+}
+
+static int handle_add_event(struct cxl_memdev_state *mds,
+			    struct cxl_event_dcd *event)
+{
+	struct device *dev = mds->cxlds.dev;
+	int rc;
+
+	rc = add_to_pending_list(&mds->add_ctx.pending_extents, &event->extent);
+	if (rc) {
+		return rc;
+	}
+
+	if (event->flags & CXL_DCD_EVENT_MORE) {
+		dev_dbg(dev, "more bit set; delay the surfacing of extent\n");
+		return 0;
+	}
+
+	rc = cxl_add_pending(mds);
+	clear_pending_extents(mds);
+	return rc;
+}
+
+static char *cxl_dcd_evt_type_str(u8 type)
+{
+	switch (type) {
+	case DCD_ADD_CAPACITY:
+		return "add";
+	case DCD_RELEASE_CAPACITY:
+		return "release";
+	case DCD_FORCED_CAPACITY_RELEASE:
+		return "force release";
+	default:
+		break;
+	}
+
+	return "<unknown>";
+}
+
+static void cxl_handle_dcd_event_records(struct cxl_memdev_state *mds,
+					struct cxl_event_record_raw *raw_rec)
+{
+	struct cxl_event_dcd *event = &raw_rec->event.dcd;
+	struct cxl_extent *extent = &event->extent;
+	struct device *dev = mds->cxlds.dev;
+	uuid_t *id = &raw_rec->id;
+	int rc;
+
+	if (!uuid_equal(id, &CXL_EVENT_DC_EVENT_UUID))
+		return;
+
+	dev_dbg(dev, "DCD event %s : DPA:%#llx LEN:%#llx\n",
+		cxl_dcd_evt_type_str(event->event_type),
+		le64_to_cpu(extent->start_dpa), le64_to_cpu(extent->length));
+
+	switch (event->event_type) {
+	case DCD_ADD_CAPACITY:
+		rc = handle_add_event(mds, event);
+		break;
+	case DCD_RELEASE_CAPACITY:
+		rc = cxl_rm_extent(mds, &event->extent);
+		break;
+	case DCD_FORCED_CAPACITY_RELEASE:
+		dev_err_ratelimited(dev, "Forced release event ignored.\n");
+		rc = 0;
+		break;
+	default:
+		rc = -EINVAL;
+		break;
+	}
+
+	if (rc)
+		dev_err_ratelimited(dev, "dcd event failed: %d\n", rc);
+}
+
 static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 				    enum cxl_event_log_type type)
 {
@@ -1130,9 +1518,13 @@ static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 		if (!nr_rec)
 			break;
 
-		for (i = 0; i < nr_rec; i++)
+		for (i = 0; i < nr_rec; i++) {
 			__cxl_event_trace_record(cxlmd, type,
 						 &payload->records[i]);
+			if (type == CXL_EVENT_TYPE_DCD)
+				cxl_handle_dcd_event_records(mds,
+							&payload->records[i]);
+		}
 
 		if (payload->flags & CXL_GET_EVENT_FLAG_OVERFLOW)
 			trace_cxl_overflow(cxlmd, type, payload);
@@ -1164,6 +1556,8 @@ void cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status)
 {
 	dev_dbg(mds->cxlds.dev, "Reading event logs: %x\n", status);
 
+	if (cxl_dcd_supported(mds) && (status & CXLDEV_EVENT_STATUS_DCD))
+		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_DCD);
 	if (status & CXLDEV_EVENT_STATUS_FATAL)
 		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FATAL);
 	if (status & CXLDEV_EVENT_STATUS_FAIL)
@@ -1763,6 +2157,11 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev)
 	mds->cxlds.cxl_mbox.host = dev;
 	mds->cxlds.reg_map.resource = CXL_RESOURCE_NONE;
 	mds->cxlds.type = CXL_DEVTYPE_CLASSMEM;
+	INIT_LIST_HEAD(&mds->add_ctx.pending_extents);
+
+	rc = devm_add_action_or_reset(dev, clear_pending_extents, mds);
+	if (rc)
+		return ERR_PTR(rc);
 
 	rc = devm_cxl_register_mce_notifier(dev, &mds->mce_notifier);
 	if (rc == -EOPNOTSUPP)
