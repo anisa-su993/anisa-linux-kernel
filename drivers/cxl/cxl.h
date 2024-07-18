@@ -12,6 +12,10 @@
 #include <linux/node.h>
 #include <linux/io.h>
 #include <linux/range.h>
+#include <linux/xarray.h>
+
+/* FIXME needed? */
+#include <cxl/event.h>
 
 extern const struct nvdimm_security_ops *cxl_security_ops;
 
@@ -170,11 +174,13 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
 #define CXLDEV_EVENT_STATUS_WARN		BIT(1)
 #define CXLDEV_EVENT_STATUS_FAIL		BIT(2)
 #define CXLDEV_EVENT_STATUS_FATAL		BIT(3)
+#define CXLDEV_EVENT_STATUS_DCD			BIT(4)
 
 #define CXLDEV_EVENT_STATUS_ALL (CXLDEV_EVENT_STATUS_INFO |	\
 				 CXLDEV_EVENT_STATUS_WARN |	\
 				 CXLDEV_EVENT_STATUS_FAIL |	\
-				 CXLDEV_EVENT_STATUS_FATAL)
+				 CXLDEV_EVENT_STATUS_FATAL |	\
+				 CXLDEV_EVENT_STATUS_DCD)
 
 /* CXL rev 3.0 section 8.2.9.2.4; Table 8-52 */
 #define CXLDEV_EVENT_INT_MODE_MASK	GENMASK(1, 0)
@@ -386,6 +392,37 @@ enum cxl_decoder_state {
 	CXL_DECODER_STATE_AUTO,
 };
 
+struct cxl_dc_tag_group;
+
+/**
+ * struct dc_extent - A single dynamic-capacity extent surfaced to the host.
+ *
+ * One per device-stamped extent.  Multiple dc_extents that share a tag
+ * (see &struct cxl_dc_tag_group) form a single logical allocation, but
+ * each dc_extent has its own HPA range and is the unit that the DAX
+ * layer sees as a backing dax_resource.
+ *
+ * @dev: device representing this extent; child of cxlr_dax->dev.
+ * @group: containing tag group (allocation); shared across siblings.
+ * @cxled: endpoint decoder backing the DPA range.
+ * @dpa_range: DPA range this extent covers within @cxled.
+ * @hpa_range: HPA range that @dpa_range decodes to, relative to
+ *	       cxlr_dax->hpa_range.start.
+ * @uuid: tag uuid (matches @group->uuid; kept for the release-path log).
+ * @shared_extn_seq: per-allocation sequence number (CXL 3.1 Table 8-51);
+ *		     0 for non-sharable allocations, 1..n within a sharable
+ *		     tag group.
+ */
+struct dc_extent {
+	struct device dev;
+	struct cxl_dc_tag_group *group;
+	struct cxl_endpoint_decoder *cxled;
+	struct range dpa_range;
+	struct range hpa_range;
+	uuid_t uuid;
+	u16 shared_extn_seq;
+};
+
 /**
  * struct cxl_endpoint_decoder - Endpoint  / SPA to DPA decoder
  * @cxld: base cxl_decoder_object
@@ -544,6 +581,7 @@ enum cxl_partition_mode {
  * @type: Endpoint decoder target type
  * @cxl_nvb: nvdimm bridge for coordinating @cxlr_pmem setup / shutdown
  * @cxlr_pmem: (for pmem regions) cached copy of the nvdimm bridge
+ * @cxlr_dax: (for DC regions) cached copy of CXL DAX bridge
  * @flags: Region state flags
  * @params: active + config params for the region
  * @coord: QoS access coordinates for the region
@@ -559,6 +597,7 @@ struct cxl_region {
 	enum cxl_decoder_type type;
 	struct cxl_nvdimm_bridge *cxl_nvb;
 	struct cxl_pmem_region *cxlr_pmem;
+	struct cxl_dax_region *cxlr_dax;
 	unsigned long flags;
 	struct cxl_region_params params;
 	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
@@ -605,11 +644,60 @@ struct cxl_pmem_region {
 	struct cxl_pmem_region_mapping mapping[];
 };
 
+/* See CXL 3.1 8.2.9.2.1.6 */
+enum dc_event {
+	DCD_ADD_CAPACITY,
+	DCD_RELEASE_CAPACITY,
+	DCD_FORCED_CAPACITY_RELEASE,
+	DCD_REGION_CONFIGURATION_UPDATED,
+};
+
 struct cxl_dax_region {
 	struct device dev;
 	struct cxl_region *cxlr;
 	struct range hpa_range;
+	/*
+	 * dc_extents is keyed by an allocator-assigned u32 (see
+	 * online_tag_group()).  Tag groups have no first-class identity in
+	 * this xarray; siblings within a tag find each other via
+	 * dc_extent->group.  Tag-uniqueness lookup is a linear xa_for_each
+	 * walk, adequate at the bounded per-region extent counts the
+	 * driver handles.
+	 */
+	struct xarray dc_extents;
 };
+
+/**
+ * struct cxl_dc_tag_group - A tagged dynamic-capacity allocation.
+ *
+ * Container for the &struct dc_extent siblings that share a tag.  The
+ * group has no sysfs identity; userspace sees the individual dc_extents
+ * directly under the parent dax_region device.  The group exists to
+ * keep tag-scoped invariants (atomic add, atomic release, ordered carve
+ * by shared_extn_seq) in one place.
+ *
+ * @cxlr_dax: back reference to parent region device.
+ * @uuid: tag identifying this allocation; same across all member dc_extents.
+ * @dc_extents: xarray of &struct dc_extent in this group, indexed by
+ *		shared_extn_seq.  For non-sharable single-extent allocations
+ *		the key is 0; for sharable allocations the keys are 1..n.
+ * @nr_extents: live count of dc_extents in the group; the group is freed
+ *		when the last dc_extent device is released.
+ */
+struct cxl_dc_tag_group {
+	struct cxl_dax_region *cxlr_dax;
+	uuid_t uuid;
+	struct xarray dc_extents;
+	unsigned int nr_extents;
+};
+
+bool is_dc_extent(struct device *dev);
+static inline struct dc_extent *to_dc_extent(struct device *dev)
+{
+	if (!is_dc_extent(dev))
+		return NULL;
+	return container_of(dev, struct dc_extent, dev);
+}
 
 /**
  * struct cxl_port - logical collection of upstream port devices and

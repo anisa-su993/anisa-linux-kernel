@@ -5,6 +5,9 @@
 #include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/unaligned.h>
+#include <linux/list.h>
+#include <linux/list_sort.h>
+#include <linux/sizes.h>
 #include <cxlpci.h>
 #include <cxlmem.h>
 #include <cxl.h>
@@ -936,6 +939,109 @@ out:
 }
 EXPORT_SYMBOL_NS_GPL(cxl_enumerate_cmds, "CXL");
 
+/*
+ * Find the DC (Dynamic Capacity) partition that fully contains @ext_range,
+ * or NULL if the extent falls outside every DC partition on this memdev.
+ * The returned pointer is owned by mds->cxlds.part[] and lives for the
+ * lifetime of the memdev.
+ */
+static const struct cxl_dpa_partition *
+cxl_extent_dc_partition(struct cxl_memdev_state *mds,
+			struct cxl_extent *extent,
+			struct range *ext_range)
+{
+	struct cxl_dev_state *cxlds = &mds->cxlds;
+	struct device *dev = mds->cxlds.dev;
+
+	for (int i = 0; i < cxlds->nr_partitions; i++) {
+		struct cxl_dpa_partition *part = &cxlds->part[i];
+		struct range partition_range = {
+			.start = part->res.start,
+			.end = part->res.end,
+		};
+
+		if (part->mode != CXL_PARTMODE_DYNAMIC_RAM_A)
+			continue;
+
+		if (range_contains(&partition_range, ext_range)) {
+			dev_dbg(dev, "DC extent DPA %pra (DCR:%pra)(%pU)\n",
+				ext_range, &partition_range, extent->uuid);
+			return part;
+		}
+	}
+
+	dev_err_ratelimited(dev,
+			    "DC extent DPA %pra (%pU) is not in a valid DC partition\n",
+			    ext_range, extent->uuid);
+	return NULL;
+}
+
+/*
+ * Per-extent validation for an Add-Capacity event.  Two regimes, chosen
+ * by the DC partition's CDAT-advertised sharability:
+ *
+ *   Sharable partition (DSMAS flag ACPI_CDAT_DSMAS_SHAREABLE,
+ *   reflected in part->perf.shareable):
+ *     - A non-null tag (UUID) is required.  The tag is the allocation
+ *       identity that every host sharing the allocation uses.
+ *     - shared_extn_seq must be non-zero.  Together with the other
+ *       members of the tag group it forms the 1..n contiguous set that
+ *       cxl_check_group_seq() enforces.
+ *
+ *   Non-sharable partition:
+ *     - The tag is optional; null UUID is permitted.
+ *     - shared_extn_seq must be 0.  Sequencing is meaningless when
+ *       only one host consumes the allocation.
+ *
+ * Any cross-mixing (sharable partition with null tag or seq == 0;
+ * non-sharable partition with non-zero seq) is a device firmware bug.
+ * Partition-boundary and region-attachment checks are separate.
+ */
+static int cxl_validate_extent(struct cxl_memdev_state *mds,
+			       struct cxl_extent_list_node *pos)
+{
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent *extent = pos->extent;
+	struct range ext_range = (struct range) {
+		.start = le64_to_cpu(extent->start_dpa),
+		.end = le64_to_cpu(extent->start_dpa) +
+			le64_to_cpu(extent->length) - 1,
+	};
+	uuid_t *uuid = (uuid_t *)extent->uuid;
+	const struct cxl_dpa_partition *part;
+	u16 seq = le16_to_cpu(extent->shared_extn_seq);
+
+	part = cxl_extent_dc_partition(mds, extent, &ext_range);
+	if (!part)
+		return -ENXIO;
+
+	if (part->perf.shareable) {
+		if (uuid_is_null(uuid)) {
+			dev_err_ratelimited(dev,
+				"DC extent DPA %pra: sharable-partition extent has null tag (firmware bug)\n",
+				&ext_range);
+			return -ENXIO;
+		}
+		if (seq == 0) {
+			dev_err_ratelimited(dev,
+				"DC extent DPA %pra (%pU): sharable-partition extent missing shared_extn_seq (firmware bug)\n",
+				&ext_range, uuid);
+			return -ENXIO;
+		}
+		return 0;
+	}
+
+	/* Non-sharable partition. */
+	if (seq != 0) {
+		dev_err_ratelimited(dev,
+			"DC extent DPA %pra (%pU): non-sharable partition but shared_extn_seq=%u (firmware bug)\n",
+			&ext_range, uuid, seq);
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
 void cxl_event_trace_record(const struct cxl_memdev *cxlmd,
 			    enum cxl_event_log_type type,
 			    enum cxl_event_type event_type,
@@ -1101,6 +1207,718 @@ free_pl:
 	return rc;
 }
 
+static int send_one_response(struct cxl_mailbox *cxl_mbox,
+			     struct cxl_mbox_dc_response *response,
+			     int opcode, u32 extent_list_size, u8 flags)
+{
+	struct cxl_mbox_cmd mbox_cmd = (struct cxl_mbox_cmd) {
+		.opcode = opcode,
+		.size_in = struct_size(response, extent_list, extent_list_size),
+		.payload_in = response,
+	};
+
+	response->extent_list_size = cpu_to_le32(extent_list_size);
+	response->flags = flags;
+	return cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
+}
+
+static int cxl_send_dc_response(struct cxl_memdev_state *mds, int opcode,
+				struct list_head *extent_list, int cnt)
+{
+	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+	struct cxl_mbox_dc_response *p;
+	struct cxl_extent_list_node *pos, *tmp;
+	struct cxl_extent *extent;
+	u32 pl_index;
+
+	size_t pl_size = struct_size(p, extent_list, cnt);
+	u32 max_extents = cnt;
+
+	/* May have to use more bit on response. */
+	if (pl_size > cxl_mbox->payload_size) {
+		max_extents = (cxl_mbox->payload_size - sizeof(*p)) /
+			      sizeof(struct updated_extent_list);
+		pl_size = struct_size(p, extent_list, max_extents);
+	}
+
+	struct cxl_mbox_dc_response *response __free(kfree) =
+						kzalloc(pl_size, GFP_KERNEL);
+	if (!response)
+		return -ENOMEM;
+
+	if (cnt == 0)
+		return send_one_response(cxl_mbox, response, opcode, 0, 0);
+
+	pl_index = 0;
+	list_for_each_entry_safe(pos, tmp, extent_list, list) {
+		extent = pos->extent;
+		response->extent_list[pl_index].dpa_start = extent->start_dpa;
+		response->extent_list[pl_index].length = extent->length;
+		pl_index++;
+
+		if (pl_index == max_extents) {
+			u8 flags = 0;
+			int rc;
+
+			if (pl_index < cnt)
+				flags |= CXL_DCD_EVENT_MORE;
+			rc = send_one_response(cxl_mbox, response, opcode,
+					       pl_index, flags);
+			if (rc)
+				return rc;
+			cnt -= pl_index;
+			if (cnt < max_extents)
+				max_extents = cnt;
+			pl_index = 0;
+		}
+	}
+
+	if (!pl_index) /* nothing more to do */
+		return 0;
+	return send_one_response(cxl_mbox, response, opcode, pl_index, 0);
+}
+
+static void delete_extent_node(struct cxl_extent_list_node *node)
+{
+	list_del(&node->list);
+	kfree(node->extent);
+	kfree(node);
+}
+
+void memdev_release_extent(struct cxl_memdev_state *mds, struct range *range)
+{
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent_list_node *node;
+	LIST_HEAD(extent_list);
+
+	dev_dbg(dev, "Release response dpa %pra\n", range);
+
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return;
+
+	node->extent = kzalloc(sizeof(*node->extent), GFP_KERNEL);
+	if (!node->extent) {
+		kfree(node);
+		return;
+	}
+
+	node->extent->start_dpa = cpu_to_le64(range->start);
+	node->extent->length = cpu_to_le64(range_len(range));
+	list_add_tail(&node->list, &extent_list);
+
+	if (cxl_send_dc_response(mds, CXL_MBOX_OP_RELEASE_DC, &extent_list, 1))
+		dev_dbg(dev, "Failed to release %pra\n", range);
+
+	delete_extent_node(node);
+}
+
+static void clear_pending_extents(void *_mds)
+{
+	struct cxl_memdev_state *mds = _mds;
+	struct cxl_extent_list_node *pos, *tmp;
+
+	list_for_each_entry_safe(pos, tmp, &mds->add_ctx.pending_extents, list) {
+                delete_extent_node(pos);
+        }
+	mds->add_ctx.group = NULL;
+}
+
+/*
+ * Device-dax requires extent boundaries aligned to its mapping granularity.
+ * Use SZ_2M as a conservative default; a tighter check that queries the
+ * cxl_dax_region / cxl_endpoint_decoder for its actual alignment would be
+ * strictly more correct, but SZ_2M is the minimum device-dax supports on
+ * every architecture that enables CXL DCD today.
+ */
+#define CXL_DCD_EXTENT_ALIGN	SZ_2M
+
+static bool cxl_extent_dcd_aligned(const struct cxl_extent *extent)
+{
+	u64 start = le64_to_cpu(extent->start_dpa);
+	u64 len = le64_to_cpu(extent->length);
+
+	return IS_ALIGNED(start, CXL_DCD_EXTENT_ALIGN) &&
+	       IS_ALIGNED(len, CXL_DCD_EXTENT_ALIGN);
+}
+
+/*
+ * Compare two extents by shared_extn_seq (ascending).
+ *
+ * Per CXL 3.1 Table 8-51, shared_extn_seq is defined only for extents in
+ * *sharable* CDAT regions: those extents are required to carry both a
+ * non-null tag and a per-allocation sequence number so multiple hosts
+ * reading the same allocation assemble the extents into the same order.
+ *
+ * Extents in non-sharable regions do not carry a sequence number
+ * (shared_extn_seq == 0 on every extent); for those, a single host's
+ * arrival order is a sufficient definition of "the order the device
+ * sent them."  list_sort() is stable, so when every element in a group
+ * has shared_extn_seq == 0, ties fall back to list order — which is
+ * arrival order via list_add_tail() in add_to_pending_list().  One
+ * comparator, both regimes.
+ */
+static int extent_seq_compare(void *priv,
+			      const struct list_head *a,
+			      const struct list_head *b)
+{
+	const struct cxl_extent_list_node *ea =
+		list_entry(a, struct cxl_extent_list_node, list);
+	const struct cxl_extent_list_node *eb =
+		list_entry(b, struct cxl_extent_list_node, list);
+	u16 sa = le16_to_cpu(ea->extent->shared_extn_seq);
+	u16 sb = le16_to_cpu(eb->extent->shared_extn_seq);
+
+	if (sa < sb)
+		return -1;
+	if (sa > sb)
+		return 1;
+	return 0;
+}
+
+/*
+ * Move every pending extent whose tag matches @tag onto @group, preserving
+ * the order they appear in @pending.  @group is left in arrival order so
+ * the caller can then sort it by shared_extn_seq with list_sort()'s stable
+ * ordering guarantee.
+ */
+static void extract_tag_group(struct list_head *pending,
+			      const uuid_t *tag,
+			      struct list_head *group)
+{
+	struct cxl_extent_list_node *pos, *tmp;
+
+	list_for_each_entry_safe(pos, tmp, pending, list) {
+		uuid_t t;
+
+		import_uuid(&t, pos->extent->uuid);
+		if (uuid_equal(&t, tag))
+			list_move_tail(&pos->list, group);
+	}
+}
+
+/*
+ * Detect a tagged allocation re-appearing after its More-chain closed.
+ *
+ * A More-chain (the sequence of Add-Capacity events terminated by
+ * More=0) guarantees completeness for every tag it carries: once the
+ * chain ends, no extent bearing a tag that appeared inside it may
+ * arrive in any later chain.  This is true for tagged extents whether
+ * or not they carry shared_extn_seq — sequencing is a sharable-region
+ * concern, completeness is a general one.
+ *
+ * Detection here is a linear walk of cxlr_dax->dc_extents (keyed by
+ * allocator-assigned IDs, not by UUID) comparing each stored
+ * dc_extent's containing tag against the incoming tag.
+ *
+ * Returns true iff @tag is non-null AND a dc_extent whose tag group
+ * uuid matches already exists on the target region.  For an untagged
+ * (null-UUID) extent the check is skipped: the spec is silent on
+ * aggregating untagged extents across More-chains, so we don't
+ * manufacture a rule here.
+ */
+static bool cxl_tag_already_committed(struct cxl_memdev_state *mds,
+				      struct cxl_extent *extent,
+				      const uuid_t *tag)
+{
+	u64 start_dpa = le64_to_cpu(extent->start_dpa);
+	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
+	struct cxl_dax_region *cxlr_dax;
+	struct dc_extent *dce;
+	struct cxl_region *cxlr;
+	unsigned long idx;
+
+	if (uuid_is_null(tag))
+		return false;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	cxlr = cxl_dpa_to_region(cxlmd, start_dpa, NULL);
+	if (!cxlr)
+		return false;
+
+	cxlr_dax = cxlr->cxlr_dax;
+	xa_for_each(&cxlr_dax->dc_extents, idx, dce) {
+		if (uuid_equal(&dce->group->uuid, tag))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Validate shared_extn_seq across a tag group already sorted ascending.
+ *
+ * Per CXL 3.1 Table 8-51, shared_extn_seq is the per-allocation
+ * extent sequence number.  Interpretation:
+ *
+ *   - For extents in non-sharable regions the field is unused; every
+ *     extent of the allocation carries shared_extn_seq == 0.
+ *   - For extents in sharable regions the field carries the device's
+ *     stamped position within the allocation.  Valid values are 1..n
+ *     where n is the number of extents in the allocation; the set
+ *     must be contiguous (no gaps), unique (no duplicates), and
+ *     complete (no missing positions).  0 is reserved as the
+ *     "non-sharable" marker and is not a valid sharable sequence
+ *     number.
+ *
+ * Hence a tag group is well-formed iff either (a) every extent has
+ * shared_extn_seq == 0, or (b) the sorted group is exactly 1, 2, ...,
+ * n.  Anything else — a mix of 0 and non-zero values, a non-zero set
+ * that does not start at 1, a gap, or a duplicate — is a device
+ * firmware bug.  Reject the whole group in those cases; partial
+ * acceptance would surface a dax device whose backing layout does
+ * not reflect the device's allocation.
+ *
+ * cxl_validate_extent() enforces the per-extent partition/sharable
+ * consistency (sharable partition -> non-null tag + non-zero seq;
+ * non-sharable -> seq == 0), so by the time a group reaches this
+ * check all members agree on regime.  This helper then enforces the
+ * group-level invariants the per-extent check cannot see: that
+ * sharable groups form an exact 1..n set with no gap or duplicate.
+ */
+static int cxl_check_group_seq(struct device *dev,
+			       const uuid_t *tag,
+			       const struct list_head *group)
+{
+	struct cxl_extent_list_node *pos;
+	u16 first, expected;
+
+	if (list_empty(group))
+		return 0;
+
+	pos = list_first_entry(group, struct cxl_extent_list_node, list);
+	first = le16_to_cpu(pos->extent->shared_extn_seq);
+
+	if (first == 0) {
+		/* Non-sharable: every member must be 0. */
+		list_for_each_entry(pos, group, list) {
+			if (le16_to_cpu(pos->extent->shared_extn_seq) != 0) {
+				dev_warn(dev,
+					 "Tag %pUb: shared_extn_seq mixed 0/non-zero in one allocation (firmware bug)\n",
+					 tag);
+				return -EINVAL;
+			}
+		}
+		return 0;
+	}
+
+	/* Sharable: group must be exactly 1, 2, ..., n (contiguous). */
+	if (first != 1) {
+		dev_warn(dev,
+			 "Tag %pUb: shared_extn_seq starts at %u, expected 1 (firmware bug)\n",
+			 tag, first);
+		return -EINVAL;
+	}
+
+	expected = 1;
+	list_for_each_entry(pos, group, list) {
+		u16 s = le16_to_cpu(pos->extent->shared_extn_seq);
+
+		if (s != expected) {
+			dev_warn(dev,
+				 "Tag %pUb: shared_extn_seq gap/dup: expected %u got %u (firmware bug)\n",
+				 tag, expected, s);
+			return -EINVAL;
+		}
+		expected++;
+	}
+	return 0;
+}
+
+/*
+ * For tagged groups, reject allocations that span DC partitions.
+ *
+ * A tag is an allocation identity; the CDAT DSMAS entry that describes
+ * the containing DC partition is what tells the host which attributes
+ * (sharable, writable, HW cache coherency) apply.  At current driver
+ * granularity each DC partition is described by at most one DSMAS and
+ * the only plumbed attribute is part->perf.shareable — but partition
+ * identity is a sufficient proxy for "same set of CDAT attributes."
+ * Comparing the containing cxl_dpa_partition of every extent to the
+ * first extent's therefore implicitly enforces attribute equality for
+ * all attributes the driver distinguishes today, and will keep doing so
+ * as more attributes become CDAT-plumbed.
+ *
+ * Untagged (null-UUID) groups are not meaningful here: the spec does
+ * not define a cross-chain identity for them and the driver aggregates
+ * them separately; skip the check.
+ */
+static int cxl_check_group_partition(struct cxl_memdev_state *mds,
+				     const uuid_t *tag,
+				     const struct list_head *group)
+{
+	struct device *dev = mds->cxlds.dev;
+	const struct cxl_dpa_partition *first_part = NULL;
+	u64 first_dpa = 0;
+	struct cxl_extent_list_node *pos;
+
+	if (uuid_is_null(tag) || list_empty(group))
+		return 0;
+
+	list_for_each_entry(pos, group, list) {
+		struct cxl_extent *extent = pos->extent;
+		struct range ext_range = (struct range) {
+			.start = le64_to_cpu(extent->start_dpa),
+			.end = le64_to_cpu(extent->start_dpa) +
+				le64_to_cpu(extent->length) - 1,
+		};
+		const struct cxl_dpa_partition *part;
+
+		part = cxl_extent_dc_partition(mds, extent, &ext_range);
+		if (!part)
+			return -ENXIO;
+
+		if (!first_part) {
+			first_part = part;
+			first_dpa = ext_range.start;
+			continue;
+		}
+
+		if (part != first_part) {
+			dev_warn(dev,
+				 "Tag %pUb: extents span DC partitions (DPA:%#llx and DPA:%#llx), firmware bug\n",
+				 tag, first_dpa, ext_range.start);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Assemble the pending Add-Capacity events into dax devices and send the
+ * ADD_DC_RESPONSE.
+ *
+ * Spec semantics (CXL 3.1 8.2.9.9.9.3 / 8.2.9.2.1.6):
+ *
+ *   - The unit of allocation is a *tag*, not a More-chain.  All extents
+ *     that share the same tag form one allocation and must be assembled
+ *     into a single dax device.  For extents in sharable CDAT regions
+ *     a non-null tag is required; for extents in non-sharable regions
+ *     the tag is optional — the null UUID is a valid "untagged"
+ *     allocation identity.
+ *
+ *   - Within a tag, extents must be ordered by shared_extn_seq (the
+ *     per-allocation sequence number, Table 8-51).  shared_extn_seq is
+ *     a sharable-region concern: multiple hosts reading the same
+ *     allocation need to agree on assembly order, so the device stamps
+ *     each extent with its position.  For non-sharable extents the
+ *     spec does not provide sequence numbers (shared_extn_seq == 0 on
+ *     every extent); the lone host simply assembles in arrival order.
+ *     list_sort() is stable, so one comparator handles both cases:
+ *     sequence-number order when it is populated, arrival order when
+ *     every tie key is zero.
+ *
+ *     Valid sharable values are 1..n, contiguous and unique across the
+ *     n extents of one allocation; 0 is reserved for the non-sharable
+ *     marker.  A tag group is well-formed iff either every member is
+ *     0 or the sorted group is exactly 1, 2, ..., n.  See
+ *     cxl_check_group_seq().
+ *
+ *   - A More-chain is a delivery boundary, not an allocation boundary:
+ *     it may carry extents for several distinct tags.  What More=0
+ *     guarantees is completeness — for every tag that appears inside
+ *     the chain, all of that tag's extents are delivered by the time
+ *     the chain closes.  This completeness guarantee applies to tagged
+ *     allocations regardless of whether the extents carry sequence
+ *     numbers.  Therefore, receiving an extent bearing a tag that a
+ *     previous More-chain already committed is a device firmware bug:
+ *     the tag's allocation was supposed to have been complete when its
+ *     chain closed.  The untagged case is excluded — the spec does not
+ *     define a cross-chain identity for untagged extents.
+ *
+ *   - An allocation is not required to be DPA-contiguous; extents exist
+ *     precisely so the device can satisfy one allocation from scattered
+ *     DPA pieces.
+ *
+ *   - Untagged extents from distinct events: the spec is silent on
+ *     aggregation.  Collapsing them into a single untagged dax device
+ *     is the simplest conformant choice and is what the existing
+ *     cxl_add_extent()/uuid_equal() logic implements for the null-UUID
+ *     case.
+ *
+ * Enforced here, per tag group (in first-appearance order of the tag):
+ *
+ *     1. Extract the group to a local list, then stable-sort by
+ *        shared_extn_seq.  For sharable extents this walks the group
+ *        in device-stamped sequence order; for non-sharable extents
+ *        every key is 0 and the stable sort preserves arrival order.
+ *     2. Cross-More-chain uniqueness — if this (tagged) group's tag
+ *        already maps to a committed dc_extent on its target
+ *        cxlr_dax, the device has re-sent a completed allocation.
+ *        Drop the whole group with a firmware-bug warning.  Skipped
+ *        for the null UUID.
+ *     3. Sequence-number integrity — either every member carries
+ *        shared_extn_seq == 0 (non-sharable allocation) or the sorted
+ *        group is exactly 1, 2, ..., n (sharable).  Mix, gap,
+ *        duplicate, or a non-zero set that does not start at 1 is a
+ *        firmware bug; drop the whole group.
+ *     4. Partition equality — for tagged groups, every extent must
+ *        resolve to the same DC partition.  CDAT describes a partition
+ *        with a DSMAS entry carrying sharable / writable / coherency
+ *        attributes; a single allocation cannot span differing CDAT
+ *        attributes.  Skipped for the null UUID.
+ *     5. Alignment gate — every extent's start_dpa and length must be
+ *        CXL_DCD_EXTENT_ALIGN-aligned, else drop the whole group with
+ *        a warning.  Partial acceptance would leave an unusable dax
+ *        device.
+ *     6. Validate + cxl_add_extent() each surviving extent into a fresh
+ *        tag group built up in add_ctx.
+ *     7. Online + notify the tag group, splice accepted extents into
+ *        the response list, clear the add_ctx slot so the next tag's
+ *        group can build its own.  online_tag_group() inserts each
+ *        member dc_extent into cxlr_dax->dc_extents (an xarray keyed
+ *        by an allocator-assigned ID, not by UUID), which is what
+ *        allows multiple tagged allocations to surface as independent
+ *        sysfs extents under one DAX region.
+ */
+static int cxl_add_pending(struct cxl_memdev_state *mds)
+{
+	struct device *dev = mds->cxlds.dev;
+	struct list_head *pending = &mds->add_ctx.pending_extents;
+	struct cxl_extent_list_node *pos, *tmp;
+	LIST_HEAD(accepted);
+	int total_accepted = 0;
+
+	while (!list_empty(pending)) {
+		LIST_HEAD(group);
+		struct cxl_dc_tag_group *tag_group;
+		bool aligned = true;
+		int group_cnt = 0;
+		uuid_t tag;
+		int rc;
+
+		/*
+		 * (1) Extract this tag's extents from pending, then order
+		 * them by shared_extn_seq.  The outer tag is picked by the
+		 * first-appearance extent in pending; groups *within* a tag
+		 * are ordered by the per-allocation sequence number, which
+		 * is the invariant the spec defines.
+		 */
+		import_uuid(&tag,
+			list_first_entry(pending,
+					 struct cxl_extent_list_node,
+					 list)->extent->uuid);
+		extract_tag_group(pending, &tag, &group);
+		list_sort(NULL, &group, extent_seq_compare);
+
+		/*
+		 * (2) Cross-More-chain uniqueness.  A non-null tag seen in
+		 * this group must not already correspond to a committed
+		 * tag group on its target cxlr_dax: More=0 was supposed to
+		 * close that allocation.  Firmware bug — reject the whole
+		 * group.  Any extent in the group maps to the same region
+		 * (same tag == same allocation == same target), so checking
+		 * the first suffices.
+		 */
+		pos = list_first_entry(&group, struct cxl_extent_list_node,
+				       list);
+		if (cxl_tag_already_committed(mds, pos->extent, &tag)) {
+			dev_warn(dev,
+				 "Tag %pUb: dropping group, tag already committed in a previous More-chain (firmware bug)\n",
+				 &tag);
+			list_for_each_entry_safe(pos, tmp, &group, list)
+				delete_extent_node(pos);
+			continue;
+		}
+
+		/*
+		 * (3) Sequence-number integrity.  All-zero (non-sharable)
+		 * or exact 1..n contiguous (sharable).  Anything else is a
+		 * firmware bug — reject the whole group; no partial
+		 * acceptance.
+		 */
+		if (cxl_check_group_seq(dev, &tag, &group)) {
+			list_for_each_entry_safe(pos, tmp, &group, list)
+				delete_extent_node(pos);
+			continue;
+		}
+
+		/*
+		 * (4) Partition equality — tagged allocations cannot span DC
+		 * partitions, because a DC partition is the unit at which CDAT
+		 * attributes (sharable, writable, coherency) are described.
+		 * Skipped for the null UUID.
+		 */
+		if (cxl_check_group_partition(mds, &tag, &group)) {
+			list_for_each_entry_safe(pos, tmp, &group, list)
+				delete_extent_node(pos);
+			continue;
+		}
+
+		/* (5) Alignment gate — abort the group if any member fails */
+		list_for_each_entry(pos, &group, list) {
+			if (!cxl_extent_dcd_aligned(pos->extent)) {
+				dev_warn(dev,
+					 "Tag %pUb: dropping group, extent DPA:%#llx LEN:%#llx not %u-aligned\n",
+					 &tag,
+					 le64_to_cpu(pos->extent->start_dpa),
+					 le64_to_cpu(pos->extent->length),
+					 CXL_DCD_EXTENT_ALIGN);
+				aligned = false;
+				break;
+			}
+		}
+		if (!aligned) {
+			list_for_each_entry_safe(pos, tmp, &group, list)
+				delete_extent_node(pos);
+			continue;
+		}
+
+		/*
+		 * (5) Validate + attach in seq order.  Surviving nodes stay
+		 * on @group in seq order; failed nodes are removed.
+		 */
+		list_for_each_entry_safe(pos, tmp, &group, list) {
+			if (cxl_validate_extent(mds, pos)) {
+				delete_extent_node(pos);
+				continue;
+			}
+
+			if (cxl_add_extent(mds, pos->extent)) {
+				dev_dbg(dev,
+					"Tag %pUb: failed to add extent DPA:%#llx LEN:%#llx\n",
+					&tag,
+					le64_to_cpu(pos->extent->start_dpa),
+					le64_to_cpu(pos->extent->length));
+				delete_extent_node(pos);
+				continue;
+			}
+			group_cnt++;
+		}
+
+		/* (6) online the tag group */
+		tag_group = mds->add_ctx.group;
+		if (!tag_group) {
+			/* Every extent in the group was dropped */
+			continue;
+		}
+
+		rc = cxl_region_invalidate_memregion(tag_group->cxlr_dax->cxlr);
+		if (!rc)
+			rc = online_tag_group(tag_group);
+		if (rc) {
+			dev_warn(dev,
+				 "Tag %pUb: failed to online tag group (%d)\n",
+				 &tag, rc);
+			/*
+			 * tag group was not onlined; the allocation failed.
+			 * Drop its extents so we do not mis-report acceptance
+			 * to the device.
+			 */
+			list_for_each_entry_safe(pos, tmp, &group, list)
+				delete_extent_node(pos);
+		} else {
+			/* Keep accepted extents for the response */
+			list_splice_tail_init(&group, &accepted);
+			total_accepted += group_cnt;
+		}
+
+		/* Next tag's group gets a fresh add_ctx slot */
+		mds->add_ctx.group = NULL;
+	}
+
+	/*
+	 * Response payload: all accepted extents, grouped by tag (in the
+	 * tag's first-appearance order), each group ordered by
+	 * shared_extn_seq.  pending_extents is empty at this point since
+	 * every tag group was extracted; splice the accepted list in so
+	 * cxl_send_dc_response() can walk a single list.
+	 */
+	list_splice(&accepted, pending);
+	return cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
+				    pending, total_accepted);
+}
+
+static int add_to_pending_list(struct list_head *pending_list,
+			       struct cxl_extent *to_add)
+{
+	struct cxl_extent_list_node *node;
+	struct cxl_extent *extent;
+
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+	extent = kmemdup(to_add, sizeof(*extent), GFP_KERNEL);
+	if (!extent)
+		return -ENOMEM;
+
+	node->extent = extent;
+	list_add_tail(&node->list, pending_list);
+	return 0;
+}
+
+static int handle_add_event(struct cxl_memdev_state *mds,
+			    struct cxl_event_dcd *event)
+{
+	struct device *dev = mds->cxlds.dev;
+	int rc;
+
+	rc = add_to_pending_list(&mds->add_ctx.pending_extents, &event->extent);
+	if (rc) {
+		return rc;
+	}
+
+	if (event->flags & CXL_DCD_EVENT_MORE) {
+		dev_dbg(dev, "more bit set; delay the surfacing of extent\n");
+		return 0;
+	}
+
+	rc = cxl_add_pending(mds);
+	clear_pending_extents(mds);
+	return rc;
+}
+
+static char *cxl_dcd_evt_type_str(u8 type)
+{
+	switch (type) {
+	case DCD_ADD_CAPACITY:
+		return "add";
+	case DCD_RELEASE_CAPACITY:
+		return "release";
+	case DCD_FORCED_CAPACITY_RELEASE:
+		return "force release";
+	default:
+		break;
+	}
+
+	return "<unknown>";
+}
+
+static void cxl_handle_dcd_event_records(struct cxl_memdev_state *mds,
+					struct cxl_event_record_raw *raw_rec)
+{
+	struct cxl_event_dcd *event = &raw_rec->event.dcd;
+	struct cxl_extent *extent = &event->extent;
+	struct device *dev = mds->cxlds.dev;
+	uuid_t *id = &raw_rec->id;
+	int rc;
+
+	if (!uuid_equal(id, &CXL_EVENT_DC_EVENT_UUID))
+		return;
+
+	dev_dbg(dev, "DCD event %s : DPA:%#llx LEN:%#llx\n",
+		cxl_dcd_evt_type_str(event->event_type),
+		le64_to_cpu(extent->start_dpa), le64_to_cpu(extent->length));
+
+	switch (event->event_type) {
+	case DCD_ADD_CAPACITY:
+		rc = handle_add_event(mds, event);
+		break;
+	case DCD_RELEASE_CAPACITY:
+		rc = cxl_rm_extent(mds, &event->extent);
+		break;
+	case DCD_FORCED_CAPACITY_RELEASE:
+		dev_err_ratelimited(dev, "Forced release event ignored.\n");
+		rc = 0;
+		break;
+	default:
+		rc = -EINVAL;
+		break;
+	}
+
+	if (rc)
+		dev_err_ratelimited(dev, "dcd event failed: %d\n", rc);
+}
+
 static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 				    enum cxl_event_log_type type)
 {
@@ -1137,9 +1955,13 @@ static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 		if (!nr_rec)
 			break;
 
-		for (i = 0; i < nr_rec; i++)
+		for (i = 0; i < nr_rec; i++) {
 			__cxl_event_trace_record(cxlmd, type,
 						 &payload->records[i]);
+			if (type == CXL_EVENT_TYPE_DCD)
+				cxl_handle_dcd_event_records(mds,
+							&payload->records[i]);
+		}
 
 		if (payload->flags & CXL_GET_EVENT_FLAG_OVERFLOW)
 			trace_cxl_overflow(cxlmd, type, payload);
@@ -1171,6 +1993,8 @@ void cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status)
 {
 	dev_dbg(mds->cxlds.dev, "Reading event logs: %x\n", status);
 
+	if (cxl_dcd_supported(mds) && (status & CXLDEV_EVENT_STATUS_DCD))
+		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_DCD);
 	if (status & CXLDEV_EVENT_STATUS_FATAL)
 		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FATAL);
 	if (status & CXLDEV_EVENT_STATUS_FAIL)
@@ -1770,6 +2594,11 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev)
 	mds->cxlds.cxl_mbox.host = dev;
 	mds->cxlds.reg_map.resource = CXL_RESOURCE_NONE;
 	mds->cxlds.type = CXL_DEVTYPE_CLASSMEM;
+	INIT_LIST_HEAD(&mds->add_ctx.pending_extents);
+
+	rc = devm_add_action_or_reset(dev, clear_pending_extents, mds);
+	if (rc)
+		return ERR_PTR(rc);
 
 	rc = devm_cxl_register_mce_notifier(dev, &mds->mce_notifier);
 	if (rc == -EOPNOTSUPP)
