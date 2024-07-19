@@ -6,6 +6,60 @@
 
 #include "core.h"
 
+static ssize_t offset_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct dc_extent *dc_extent = to_dc_extent(dev);
+
+	return sysfs_emit(buf, "%#llx\n", dc_extent->hpa_range.start);
+}
+static DEVICE_ATTR_RO(offset);
+
+static ssize_t length_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct dc_extent *dc_extent = to_dc_extent(dev);
+	u64 length = range_len(&dc_extent->hpa_range);
+
+	return sysfs_emit(buf, "%#llx\n", length);
+}
+static DEVICE_ATTR_RO(length);
+
+static ssize_t shared_extent_seq_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", to_dc_extent(dev)->seq_num);
+}
+static DEVICE_ATTR_RO(shared_extent_seq);
+
+static struct attribute *dc_extent_attrs[] = {
+	&dev_attr_offset.attr,
+	&dev_attr_length.attr,
+	&dev_attr_shared_extent_seq.attr,
+	NULL
+};
+
+static umode_t dc_extent_visible(struct kobject *kobj, struct attribute *a,
+				 int n)
+{
+	struct dc_extent *dc_extent = to_dc_extent(kobj_to_dev(kobj));
+	struct cxl_endpoint_decoder *cxled = dc_extent->cxled;
+	struct cxl_dev_state *cxlds = cxled_to_memdev(cxled)->cxlds;
+
+	/* The device assigns the sequence only on a sharable partition */
+	if (a == &dev_attr_shared_extent_seq.attr &&
+	    !cxlds->part[cxled->part].shareable)
+		return 0;
+
+	return a->mode;
+}
+
+static const struct attribute_group dc_extent_attribute_group = {
+	.attrs = dc_extent_attrs,
+	.is_visible = dc_extent_visible,
+};
+__ATTRIBUTE_GROUPS(dc_extent_attribute);
+
 /*
  * Host-wide list of live tag groups with non-null uuids: a tag uuid
  * identifies exactly one allocation across all regions and memdevs.
@@ -130,6 +184,7 @@ static void dc_extent_release(struct device *dev)
 static const struct device_type dc_extent_type = {
 	.name = "extent",
 	.release = dc_extent_release,
+	.groups = dc_extent_attribute_groups,
 };
 
 bool is_dc_extent(struct device *dev)
