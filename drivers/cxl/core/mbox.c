@@ -1792,7 +1792,9 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 			continue;
 		}
 
-		rc = online_region_extent(reg_ext);
+		rc = cxl_region_invalidate_memregion(reg_ext->cxlr_dax->cxlr);
+		if (!rc)
+			rc = online_region_extent(reg_ext);
 		if (rc) {
 			dev_warn(dev,
 				 "Tag %pUb: failed to online region_extent (%d)\n",
@@ -1805,6 +1807,10 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 			list_for_each_entry_safe(pos, tmp, &group, list)
 				delete_extent_node(pos);
 		} else {
+			rc = cxlr_notify_extent(reg_ext->cxlr_dax->cxlr,
+						DCD_ADD_CAPACITY, reg_ext);
+			if (rc)
+				region_rm_extent(reg_ext);
 			/* Keep accepted extents for the response */
 			list_splice_tail_init(&group, &accepted);
 			total_accepted += group_cnt;
