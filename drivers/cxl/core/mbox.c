@@ -1367,11 +1367,25 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 	}
 
 	pending_reg_ext = mds->add_ctx.region_extent;
-
-	/* device model handles freeing region_extent */
-	rc = online_region_extent(mds->add_ctx.region_extent);
+	/* Ensure caches are clean prior onlining */
+	rc = cxl_region_invalidate_memregion(pending_reg_ext->cxlr_dax->cxlr);
 	if (rc)
 		return rc;
+
+	/* device model handles freeing region_extent */
+	rc = online_region_extent(pending_reg_ext);
+	if (rc)
+		return rc;
+
+	rc = cxlr_notify_extent(pending_reg_ext->cxlr_dax->cxlr,
+				DCD_ADD_CAPACITY,
+				pending_reg_ext);
+	/*
+	 * The region device was briefly live but DAX layer ensures it was not
+	 * used
+	 */
+	if (rc)
+		region_rm_extent(pending_reg_ext);
 
 	/* Restore remaining extents to original order and send rsp */
 	list_sort(NULL, &mds->add_ctx.pending_extents, idx_compare);
