@@ -116,10 +116,16 @@ static void region_extent_unregister(void *ext)
 
 	dev_dbg(&region_extent->dev, "DAX region rm extent HPA %pra\n",
 		&region_extent->hpa_range);
+	/*
+	 * Extent is not in use or an error has occur.  No mappings
+	 * exist at this point.  Write and invalidate caches to ensure
+	 * the device has all data prior to final release.
+	 */
+	cxl_region_invalidate_memregion(region_extent->cxlr_dax->cxlr);
 	device_unregister(&region_extent->dev);
 }
 
-static void region_rm_extent(struct region_extent *region_extent)
+void region_rm_extent(struct region_extent *region_extent)
 {
 	struct device *region_dev = region_extent->dev.parent;
 
@@ -226,6 +232,38 @@ static void calc_hpa_range(struct cxl_endpoint_decoder *cxled,
 	hpa_range->end = hpa_range->start + range_len(dpa_range) - 1;
 }
 
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+			      struct region_extent *region_extent)
+{
+	struct device *dev = &cxlr->cxlr_dax->dev;
+	struct cxl_notify_data notify_data;
+	struct cxl_driver *driver;
+
+	dev_dbg(dev, "Trying notify: type %d HPA %pra\n", event,
+		&region_extent->hpa_range);
+
+	guard(device)(dev);
+
+	/*
+	 * The lack of a driver indicates a notification has failed.  No user
+	 * space coordination was possible.
+	 */
+	if (!dev->driver)
+		return 0;
+	driver = to_cxl_drv(dev->driver);
+	if (!driver->notify)
+		return 0;
+
+	notify_data = (struct cxl_notify_data) {
+		.event = event,
+		.region_extent = region_extent,
+	};
+
+	dev_dbg(dev, "Notify: type %d HPA %pra\n", event,
+		&region_extent->hpa_range);
+	return driver->notify(dev, &notify_data);
+}
+
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
@@ -236,6 +274,7 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	struct region_extent *reg_ext;
 	struct cxl_region *cxlr;
 	uuid_t tag;
+	int rc;
 
 	dpa_range = (struct range) {
 		.start = start_dpa,
@@ -289,6 +328,12 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 			&hpa_range, &reg_ext->hpa_range);
 		return -EINVAL;
 	}
+
+	rc = cxlr_notify_extent(cxlr,
+				DCD_RELEASE_CAPACITY,
+				cxlr_dax->region_extent);
+	if (rc == -EBUSY)
+		return 0;
 
 	/* Release entire capacity of the region */
 	region_rm_extent(reg_ext);

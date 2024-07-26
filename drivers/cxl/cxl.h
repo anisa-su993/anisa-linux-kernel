@@ -858,12 +858,17 @@ extern const struct bus_type cxl_bus_type;
  * by @id and the add_dport() op only defined for the CXL_DEVICE_PORT driver
  * template.
  */
+struct cxl_notify_data {
+	enum dc_event event;
+	struct region_extent *region_extent;
+};
 struct cxl_driver {
 	const char *name;
 	int (*probe)(struct device *dev);
 	void (*remove)(struct device *dev);
 	struct cxl_dport *(*add_dport)(struct cxl_port *port,
 				       struct device *dport_dev);
+	int (*notify)(struct device *dev, struct cxl_notify_data *notify_data);
 	struct device_driver drv;
 	int id;
 };
