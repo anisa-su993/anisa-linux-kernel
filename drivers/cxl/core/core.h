@@ -26,6 +26,8 @@ cxled_to_mds(struct cxl_endpoint_decoder *cxled)
 	return to_cxl_memdev_state(cxlmd->cxlds);
 }
 
+int cxl_process_extent_list(struct cxl_endpoint_decoder *cxled);
+
 #ifdef CONFIG_CXL_REGION
 
 int cxl_region_invalidate_memregion(struct cxl_region *cxlr);
