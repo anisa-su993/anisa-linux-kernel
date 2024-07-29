@@ -598,6 +598,8 @@ struct cxl_dax_region {
 	 * driver handles.
 	 */
 	struct xarray dc_extents;
+	/* Set once the probe has read the device's pre-existing extents. */
+	bool extents_scanned;
 };
 
 /**
@@ -978,6 +980,7 @@ bool is_cxl_pmem_region(struct device *dev);
 struct cxl_pmem_region *to_cxl_pmem_region(struct device *dev);
 int cxl_add_to_region(struct cxl_endpoint_decoder *cxled);
 struct cxl_dax_region *to_cxl_dax_region(struct device *dev);
+int cxl_region_add_existing_extents(struct cxl_region *cxlr);
 u64 cxl_port_get_spa_cache_alias(struct cxl_port *endpoint, u64 spa);
 bool cxl_region_contains_resource(const struct resource *res);
 #else
@@ -996,6 +999,10 @@ static inline int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
 static inline struct cxl_dax_region *to_cxl_dax_region(struct device *dev)
 {
 	return NULL;
+}
+static inline int cxl_region_add_existing_extents(struct cxl_region *cxlr)
+{
+	return 0;
 }
 static inline u64 cxl_port_get_spa_cache_alias(struct cxl_port *endpoint,
 					       u64 spa)
