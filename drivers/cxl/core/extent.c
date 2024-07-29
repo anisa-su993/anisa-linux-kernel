@@ -252,7 +252,7 @@ static int cxl_validate_extent(struct cxl_memdev_state *mds,
 			       struct cxl_extent *extent,
 			       struct cxl_endpoint_decoder **out_cxled,
 			       struct cxl_dax_region **out_cxlr_dax,
-			       struct range *out_ext_range)
+			       struct range *out_ext_range, bool existing)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
@@ -290,6 +290,13 @@ static int cxl_validate_extent(struct cxl_memdev_state *mds,
 	cxlr = cxl_dpa_to_region(cxlmd, start_dpa, &cxled);
 	if (!cxlr || !cxlr->cxlr_dax)
 		return -ENXIO;
+
+	/*
+	 * Pre-existing extents must be read before any new extent is added so a
+	 * tag already in use is never added twice; defer new adds until then.
+	 */
+	if (!existing && !smp_load_acquire(&cxlr->cxlr_dax->extents_scanned))
+		return -EBUSY;
 
 	ed_range = (struct range) {
 		.start = cxled->dpa_res->start,
@@ -369,16 +376,22 @@ dc_extent_build(struct cxl_endpoint_decoder *cxled,
 	return dc_extent;
 }
 
-int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
-		       struct cxl_dc_tag_group *group)
+/*
+ * Core notify: the caller must hold device_lock(&cxlr->cxlr_dax->dev).  Used by
+ * the existing-extent path that runs inside cxl_dax_region_probe(), where the
+ * async device-attach already holds the dax_region's device_lock — taking it
+ * again (as cxlr_notify_extent() does) would deadlock the probe against itself.
+ */
+int __cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+			 struct cxl_dc_tag_group *group)
 {
 	struct device *dev = &cxlr->cxlr_dax->dev;
 	struct cxl_notify_data notify_data;
 	struct cxl_driver *driver;
 
-	dev_dbg(dev, "Trying notify: type %d tag %pUb\n", event, &group->uuid);
+	device_lock_assert(dev);
 
-	guard(device)(dev);
+	dev_dbg(dev, "Trying notify: type %d tag %pUb\n", event, &group->uuid);
 
 	/*
 	 * The lack of a driver indicates a notification has failed.  No user
@@ -397,6 +410,13 @@ int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
 
 	dev_dbg(dev, "Notify: type %d tag %pUb\n", event, &group->uuid);
 	return driver->notify(dev, &notify_data);
+}
+
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+		       struct cxl_dc_tag_group *group)
+{
+	guard(device)(&cxlr->cxlr_dax->dev);
+	return __cxlr_notify_extent(cxlr, event, group);
 }
 
 /*
@@ -458,7 +478,7 @@ static int cxlr_add_extent(struct cxl_memdev_state *mds,
  * and <0 on error
  */
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
-		   u16 seq_num)
+		   u16 seq_num, bool existing)
 {
 	struct cxl_endpoint_decoder *cxled;
 	struct cxl_dax_region *cxlr_dax;
@@ -468,7 +488,8 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 
 	guard(rwsem_read)(&cxl_rwsem.region);
 
-	rc = cxl_validate_extent(mds, extent, &cxled, &cxlr_dax, &ext_range);
+	rc = cxl_validate_extent(mds, extent, &cxled, &cxlr_dax, &ext_range,
+				 existing);
 	if (rc)
 		return rc;
 
