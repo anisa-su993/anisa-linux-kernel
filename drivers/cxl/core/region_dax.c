@@ -82,6 +82,38 @@ static void cxlr_dax_unregister(void *_cxlr_dax)
 	device_unregister(&cxlr_dax->dev);
 }
 
+/*
+ * Process existing extents from the probe, not region creation: the probe is
+ * async, and attaching extent devres before really_probe() runs trips its
+ * "resources present" -EBUSY gate, so the dax_region never binds.
+ */
+int cxl_region_add_existing_extents(struct cxl_region *cxlr)
+{
+	struct cxl_region_params *p = &cxlr->params;
+	int i, latched_rc = 0;
+
+	for (i = 0; i < p->nr_targets; i++) {
+		struct device *dev = &p->targets[i]->cxld.dev;
+		int rc;
+
+		rc = cxl_process_extent_list(p->targets[i]);
+		if (rc) {
+			dev_err(dev, "Existing extent processing failed %d\n",
+				rc);
+			/* Process every target, but report the first error. */
+			if (!latched_rc)
+				latched_rc = rc;
+		}
+	}
+
+	/* Pre-existing extents are read; new add events may now proceed. */
+	if (!latched_rc)
+		smp_store_release(&cxlr->cxlr_dax->extents_scanned, true);
+
+	return latched_rc;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_region_add_existing_extents, "CXL");
+
 int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 {
 	struct device *dev;
@@ -110,6 +142,10 @@ int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 	dev_dbg(&cxlr->dev, "%s: register %s\n", dev_name(dev->parent),
 		dev_name(dev));
 
-	return devm_add_action_or_reset(&cxlr->dev, cxlr_dax_unregister,
-					no_free_ptr(cxlr_dax));
+	rc = devm_add_action_or_reset(&cxlr->dev, cxlr_dax_unregister,
+				      no_free_ptr(cxlr_dax));
+	if (rc)
+		return rc;
+
+	return 0;
 }
