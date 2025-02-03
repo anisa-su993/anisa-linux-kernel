@@ -344,7 +344,7 @@ static int __cxl_pci_mbox_send_cmd(struct cxl_mailbox *cxl_mbox,
 				   struct cxl_mbox_cmd *mbox_cmd)
 {
 	struct cxl_dev_state *cxlds = mbox_to_cxlds(cxl_mbox);
-	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
+	// struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 	void __iomem *payload = cxlds->regs.mbox + CXLDEV_MBOX_PAYLOAD_OFFSET;
 	struct device *dev = cxlds->dev;
 	u64 cmd_reg, status_reg;

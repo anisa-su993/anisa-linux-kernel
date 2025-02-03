@@ -776,8 +776,8 @@ err:
 static long __cxl_memdev_ioctl(struct cxl_memdev *cxlmd, unsigned int cmd,
 				   unsigned long arg)
 {
-	struct cxl_dev_state *cxlds = cxlmd->cxlds;
-	struct cxl_memdev_state *mds = container_of(cxlds, struct cxl_memdev_state, cxlds);
+	// struct cxl_dev_state *cxlds = cxlmd->cxlds;
+	// struct cxl_memdev_state *mds = container_of(cxlds, struct cxl_memdev_state, cxlds);
 
 	switch (cmd) {
 	case CXL_MEM_QUERY_COMMANDS:

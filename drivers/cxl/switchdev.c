@@ -35,7 +35,7 @@ static int cxl_swmb_setup_mailbox(struct cxl_mailbox *mbox)
 	 * __cxl_pci_mbox_send_cmd() can assume that it is the only
 	 * source for future doorbell busy events.
 	 */
-	if (cxl_pci_mbox_wait_for_doorbell(mbox) != 0) {
+	if (cxl_pci_mbox_wait_for_doorbell(cxlds) != 0) {
 		dev_err(mbox->host, "timeout awaiting mailbox idle");
 
 		return -ETIMEDOUT;
@@ -97,8 +97,7 @@ static int cxl_swmb_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct cxl_register_map map;
 	struct cxl_swdev *cxlswd;
-    struct cxl_dev_state *cxlds =
-        container_of(&cxlswd->mbox, struct cxl_dev_state, cxl_mbox);
+    struct cxl_dev_state *cxlds;
 	int rc;
 
 	rc = pcim_enable_device(pdev);
@@ -106,6 +105,7 @@ static int cxl_swmb_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return rc;
 
 	cxlswd = cxl_swdev_alloc(&pdev->dev);
+    cxlds = container_of(&cxlswd->mbox, struct cxl_dev_state, cxl_mbox);
 	if (IS_ERR(cxlswd))
 		return PTR_ERR(cxlswd);
 
@@ -171,4 +171,4 @@ static struct pci_driver cxl_swmb_driver = {
 module_pci_driver(cxl_swmb_driver);
 MODULE_DESCRIPTION("CXL Switch CCI mailbox access driver");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(CXL);
+MODULE_IMPORT_NS("CXL");
