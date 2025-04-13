@@ -23,6 +23,8 @@ cxled_to_mds(struct cxl_endpoint_decoder *cxled)
 	return container_of(cxlds, struct cxl_memdev_state, cxlds);
 }
 
+int cxl_region_invalidate_memregion(struct cxl_region *cxlr);
+
 enum cxl_detach_mode {
 	DETACH_ONLY,
 	DETACH_INVALIDATE,
