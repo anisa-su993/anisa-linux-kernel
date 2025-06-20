@@ -941,12 +941,6 @@ int cxl_internal_send_cmd(struct cxl_mailbox *cxl_mbox,
 			  struct cxl_mbox_cmd *cmd);
 int cxl_dev_state_identify(struct cxl_memdev_state *mds);
 
-struct cxl_mem_dev_info {
-	u64 total_bytes;
-	u64 volatile_bytes;
-	u64 persistent_bytes;
-};
-
 struct cxl_dc_partition_info {
 	size_t start;
 	size_t size;
