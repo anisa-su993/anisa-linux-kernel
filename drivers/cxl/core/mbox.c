@@ -196,10 +196,9 @@ static void cxl_set_dcd_cmd_enabled(struct cxl_memdev_state *mds, u16 opcode,
 static bool cxl_verify_dcd_cmds(struct cxl_memdev_state *mds, unsigned long *cmds_seen)
 {
 	DECLARE_BITMAP(all_cmds, CXL_DCD_ENABLED_MAX);
-	DECLARE_BITMAP(dst, CXL_DCD_ENABLED_MAX);
 
 	bitmap_fill(all_cmds, CXL_DCD_ENABLED_MAX);
-	return bitmap_and(dst, cmds_seen, all_cmds, CXL_DCD_ENABLED_MAX);
+	return bitmap_equal(cmds_seen, all_cmds, CXL_DCD_ENABLED_MAX);
 }
 
 static bool cxl_is_poison_command(u16 opcode)
