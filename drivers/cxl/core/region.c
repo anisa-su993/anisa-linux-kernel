@@ -3287,10 +3287,12 @@ static int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 	dev_dbg(&cxlr->dev, "%s: register %s\n", dev_name(dev->parent),
 		dev_name(dev));
 
-	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A)
-		if (cxlr_add_existing_extents(cxlr))
+	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A) {
+		rc = cxlr_add_existing_extents(cxlr);
+		if (rc)
 			dev_err(&cxlr->dev, "Existing extent processing failed %d\n",
 				rc);
+	}
 
 	return devm_add_action_or_reset(&cxlr->dev, cxlr_dax_unregister,
 					cxlr_dax);
