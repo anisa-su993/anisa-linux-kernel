@@ -18,21 +18,6 @@ static int __cxl_dax_add_resource(struct dax_region *dax_region,
 	return dax_region_add_resource(dax_region, dev, start, length);
 }
 
-static int cxl_dax_add_resource(struct device *dev, void *data)
-{
-	struct dax_region *dax_region = data;
-	struct region_extent *region_extent;
-
-	region_extent = to_region_extent(dev);
-	if (!region_extent)
-		return 0;
-
-	dev_dbg(dax_region->dev, "Adding resource HPA %pra\n",
-		&region_extent->hpa_range);
-
-	return __cxl_dax_add_resource(dax_region, region_extent);
-}
-
 static int cxl_dax_region_notify(struct device *dev,
 				 struct cxl_notify_data *notify_data)
 {
@@ -66,6 +51,7 @@ static int cxl_dax_region_probe(struct device *dev)
 	struct dev_dax_data data;
 	resource_size_t dev_size;
 	unsigned long flags;
+	int rc;
 
 	if (nid == NUMA_NO_NODE)
 		nid = memory_add_physaddr_to_nid(cxlr_dax->hpa_range.start);
@@ -80,8 +66,12 @@ static int cxl_dax_region_probe(struct device *dev)
 		return -ENOMEM;
 
 	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A) {
-		device_for_each_child(&cxlr_dax->dev, dax_region,
-				      cxl_dax_add_resource);
+		rc = cxlr_add_existing_extents(cxlr);
+		/* If adding existing extents fails, continue with only an error
+		 * message ?? */
+		if (rc)
+			dev_err(&cxlr->dev, "Existing extent processing failed %d\n",
+				rc);
 		/* Add empty seed dax device */
 		dev_size = 0;
 	} else {

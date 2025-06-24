@@ -3232,7 +3232,7 @@ err_bridge:
 	return rc;
 }
 
-static int cxlr_add_existing_extents(struct cxl_region *cxlr)
+int cxlr_add_existing_extents(struct cxl_region *cxlr)
 {
 	struct cxl_region_params *p = &cxlr->params;
 	int i, latched_rc = 0;
@@ -3251,6 +3251,7 @@ static int cxlr_add_existing_extents(struct cxl_region *cxlr)
 
 	return latched_rc;
 }
+EXPORT_SYMBOL_NS_GPL(cxlr_add_existing_extents, "CXL");
 
 static void cxlr_dax_unregister(void *_cxlr_dax)
 {
@@ -3286,13 +3287,6 @@ static int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 
 	dev_dbg(&cxlr->dev, "%s: register %s\n", dev_name(dev->parent),
 		dev_name(dev));
-
-	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A) {
-		rc = cxlr_add_existing_extents(cxlr);
-		if (rc)
-			dev_err(&cxlr->dev, "Existing extent processing failed %d\n",
-				rc);
-	}
 
 	return devm_add_action_or_reset(&cxlr->dev, cxlr_dax_unregister,
 					cxlr_dax);

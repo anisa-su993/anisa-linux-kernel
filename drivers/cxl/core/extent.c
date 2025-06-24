@@ -285,7 +285,7 @@ static int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
 	dev_dbg(dev, "Trying notify: type %d HPA %pra\n", event,
 		&region_extent->hpa_range);
 
-	guard(device)(dev);
+	// guard(device)(dev);
 
 	/*
 	 * The lack of a driver indicates a notification has failed.  No user
