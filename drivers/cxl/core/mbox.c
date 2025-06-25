@@ -1212,6 +1212,8 @@ static int cxl_send_dc_response(struct cxl_memdev_state *mds, int opcode,
 			if (rc)
 				return rc;
 			cnt -= pl_index;
+			if (cnt < max_extents)
+				max_extents = cnt;
 			pl_index = 0;
 		}
 	}
