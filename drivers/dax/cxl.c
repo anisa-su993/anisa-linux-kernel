@@ -57,7 +57,7 @@ static int cxl_dax_region_probe(struct device *dev)
 		nid = memory_add_physaddr_to_nid(cxlr_dax->hpa_range.start);
 
 	flags = IORESOURCE_DAX_KMEM;
-	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A)
+	if (is_cxl_dc_partition_mode(cxlr->mode))
 		flags |= IORESOURCE_DAX_SPARSE_CAP;
 
 	dax_region = alloc_dax_region(dev, cxlr->id, &cxlr_dax->hpa_range, nid,
@@ -65,7 +65,7 @@ static int cxl_dax_region_probe(struct device *dev)
 	if (!dax_region)
 		return -ENOMEM;
 
-	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A) {
+	if (is_cxl_dc_partition_mode(cxlr->mode)) {
 		rc = cxlr_add_existing_extents(cxlr);
 		/* If adding existing extents fails, continue with only an error
 		 * message ?? */

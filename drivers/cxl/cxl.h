@@ -503,12 +503,26 @@ struct cxl_region_params {
 	resource_size_t cache_size;
 };
 
+#define CXL_PARTITION_DC_MODE(n) CXL_PARTMODE_DYNAMIC_RAM_##n
 /* Modes should be in the implied DPA order */
 enum cxl_partition_mode {
 	CXL_PARTMODE_RAM,
 	CXL_PARTMODE_PMEM,
-	CXL_PARTMODE_DYNAMIC_RAM_A,
+	CXL_PARTITION_DC_MODE(0),
+	CXL_PARTITION_DC_MODE(1),
+	CXL_PARTITION_DC_MODE(2),
+	CXL_PARTITION_DC_MODE(3),
+	CXL_PARTITION_DC_MODE(4),
+	CXL_PARTITION_DC_MODE(5),
+	CXL_PARTITION_DC_MODE(6),
+	CXL_PARTITION_DC_MODE(7),
+	CXL_PARTITION_MODE_MAX,
 };
+
+static inline bool is_cxl_dc_partition_mode(enum cxl_partition_mode mode)
+{
+	return mode >= CXL_PARTITION_DC_MODE(0) && mode < CXL_PARTITION_MODE_MAX;
+}
 
 /*
  * Indicate whether this region has been assembled by autodetection or

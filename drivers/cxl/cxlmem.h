@@ -106,7 +106,7 @@ int devm_cxl_dpa_reserve(struct cxl_endpoint_decoder *cxled,
 			 resource_size_t base, resource_size_t len,
 			 resource_size_t skipped);
 
-#define CXL_NR_PARTITIONS_MAX 3
+#define CXL_NR_PARTITIONS_MAX 10
 
 struct cxl_dpa_info {
 	u64 size;
@@ -456,6 +456,7 @@ struct cxl_dev_state {
 	struct resource dpa_res;
 	struct cxl_dpa_partition part[CXL_NR_PARTITIONS_MAX];
 	unsigned int nr_partitions;
+	unsigned int nr_dc_partitions;
 	u64 serial;
 	enum cxl_devtype type;
 	struct cxl_mailbox cxl_mbox;
@@ -948,7 +949,7 @@ struct cxl_dc_partition_info {
 };
 
 int cxl_dev_dc_identify(struct cxl_mailbox *mbox,
-			struct cxl_dc_partition_info *dc_info);
+			struct cxl_dc_partition_info *dc_info, int *num_part);
 int cxl_await_media_ready(struct cxl_dev_state *cxlds);
 int cxl_enumerate_cmds(struct cxl_memdev_state *mds);
 int cxl_mem_dpa_fetch(struct cxl_memdev_state *mds, struct cxl_dpa_info *info);
