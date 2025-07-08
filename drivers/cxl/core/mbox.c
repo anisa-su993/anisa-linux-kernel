@@ -963,7 +963,7 @@ static int cxl_validate_extent(struct cxl_memdev_state *mds,
 	for (int i = 0; i < cxlds->nr_partitions; i++) {
 		struct cxl_dpa_partition *part = &cxlds->part[i];
 
-		if (part->mode != CXL_PARTMODE_DYNAMIC_RAM_A)
+		if (!is_cxl_dc_partition_mode(part->mode))
 			continue;
 
 		struct range partition_range = (struct range) {
@@ -1710,6 +1710,7 @@ static int cxl_get_dc_config(struct cxl_mailbox *mbox, u8 start_partition,
  *                         device.
  * @mbox: Mailbox to query
  * @dc_info: The dynamic partition information to return
+ * @num_part: The number of dynamic partitions returned
  *
  * Read Dynamic Capacity information from the device and return the partition
  * information.
@@ -1718,7 +1719,7 @@ static int cxl_get_dc_config(struct cxl_mailbox *mbox, u8 start_partition,
  *         on error only dynamic_bytes is left unchanged.
  */
 int cxl_dev_dc_identify(struct cxl_mailbox *mbox,
-			struct cxl_dc_partition_info *dc_info)
+			struct cxl_dc_partition_info *dc_info, int *num_part)
 {
 	struct cxl_dc_partition_info partitions[CXL_MAX_DC_PARTITIONS];
 	size_t dc_resp_size = mbox->payload_size;
@@ -1763,12 +1764,15 @@ int cxl_dev_dc_identify(struct cxl_mailbox *mbox,
 
 	} while (num_partitions < dc_resp->avail_partition_count);
 
-	/* Return 1st partition */
-	dc_info->start = partitions[0].start;
-	dc_info->size = partitions[0].size;
-	dc_info->handle = partitions[0].handle;
-	dev_dbg(dev, "Returning partition 0 %zu size %zu\n",
-		dc_info->start, dc_info->size);
+
+	*num_part = dc_resp->avail_partition_count;
+	for (int i = 0; i < dc_resp->avail_partition_count; i++) {
+		dc_info[i].start = partitions[i].start;
+		dc_info[i].size = partitions[i].size;
+		dc_info[i].handle = partitions[i].handle;
+		dev_dbg(dev, "Returning partition %d %zu size %zu\n",
+			i, dc_info[i].start, dc_info[i].size);
+	}
 
 	return 0;
 }
@@ -1955,12 +1959,12 @@ EXPORT_SYMBOL_NS_GPL(cxl_get_dirty_count, "CXL");
 
 void cxl_configure_dcd(struct cxl_memdev_state *mds, struct cxl_dpa_info *info)
 {
-	struct cxl_dc_partition_info dc_info = { 0 };
+	struct cxl_dc_partition_info dc_info[CXL_MAX_DC_PARTITIONS];
 	struct device *dev = mds->cxlds.dev;
 	size_t skip;
-	int rc;
+	int rc, num_part;
 
-	rc = cxl_dev_dc_identify(&mds->cxlds.cxl_mbox, &dc_info);
+	rc = cxl_dev_dc_identify(&mds->cxlds.cxl_mbox, dc_info, &num_part);
 	if (rc) {
 		dev_warn(dev,
 			 "Failed to read Dynamic Capacity config: %d\n", rc);
@@ -1969,7 +1973,7 @@ void cxl_configure_dcd(struct cxl_memdev_state *mds, struct cxl_dpa_info *info)
 	}
 
 	/* Skips between pmem and the dynamic partition are not supported */
-	skip = dc_info.start - info->size;
+	skip = dc_info[0].start - info->size;
 	if (skip) {
 		dev_warn(dev,
 			 "Dynamic Capacity skip from pmem not supported: %zu\n",
@@ -1978,10 +1982,13 @@ void cxl_configure_dcd(struct cxl_memdev_state *mds, struct cxl_dpa_info *info)
 		return;
 	}
 
-	info->size += dc_info.size;
-	dev_dbg(dev, "Adding dynamic ram partition A; %zu size %zu\n",
-		dc_info.start, dc_info.size);
-	add_part(info, dc_info.start, dc_info.size, CXL_PARTMODE_DYNAMIC_RAM_A);
+	for (int i = 0; i < num_part; i++) {
+		info->size += dc_info[i].size;
+		dev_dbg(dev, "Adding dynamic ram partition %d; %zu size %zu\n",
+			i, dc_info[i].start, dc_info[i].size);
+		add_part(info, dc_info[i].start, dc_info[i].size, CXL_PARTITION_DC_MODE(0) + i);
+	}
+	mds->cxlds.nr_dc_partitions = num_part;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_configure_dcd, "CXL");
 

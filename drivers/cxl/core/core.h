@@ -34,7 +34,14 @@ int cxl_region_invalidate_memregion(struct cxl_region *cxlr);
 #ifdef CONFIG_CXL_REGION
 extern struct device_attribute dev_attr_create_pmem_region;
 extern struct device_attribute dev_attr_create_ram_region;
-extern struct device_attribute dev_attr_create_dynamic_ram_a_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_0_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_1_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_2_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_3_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_4_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_5_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_6_region;
+extern struct device_attribute dev_attr_create_dynamic_ram_7_region;
 extern struct device_attribute dev_attr_delete_region;
 extern struct device_attribute dev_attr_region;
 extern const struct device_type cxl_pmem_region_type;

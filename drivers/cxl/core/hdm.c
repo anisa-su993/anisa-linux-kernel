@@ -463,8 +463,22 @@ static const char *cxl_mode_name(enum cxl_partition_mode mode)
 		return "ram";
 	case CXL_PARTMODE_PMEM:
 		return "pmem";
-	case CXL_PARTMODE_DYNAMIC_RAM_A:
-		return "dynamic_ram_a";
+	case CXL_PARTMODE_DYNAMIC_RAM_0:
+		return "dynamic_ram_0";
+	case CXL_PARTMODE_DYNAMIC_RAM_1:
+		return "dynamic_ram_1";
+	case CXL_PARTMODE_DYNAMIC_RAM_2:
+		return "dynamic_ram_2";
+	case CXL_PARTMODE_DYNAMIC_RAM_3:
+		return "dynamic_ram_3";
+	case CXL_PARTMODE_DYNAMIC_RAM_4:
+		return "dynamic_ram_4";
+	case CXL_PARTMODE_DYNAMIC_RAM_5:
+		return "dynamic_ram_5";
+	case CXL_PARTMODE_DYNAMIC_RAM_6:
+		return "dynamic_ram_6";
+	case CXL_PARTMODE_DYNAMIC_RAM_7:
+		return "dynamic_ram_7";
 	default:
 		return "";
 	};
