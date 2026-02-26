@@ -6,6 +6,7 @@
 #include <linux/types.h>
 #include <linux/uuid.h>
 #include <linux/workqueue_types.h>
+#include <linux/list.h>
 
 /*
  * Common Event Record Format
@@ -151,6 +152,13 @@ struct cxl_extent {
 	__le16 shared_extn_seq;
 	u8 reserved[0x6];
 } __packed;
+
+struct cxl_extent_list_node {
+	struct cxl_extent *extent;
+	struct list_head list;
+	int idx;
+	int rid;
+};
 
 /*
  * Dynamic Capacity Event Record

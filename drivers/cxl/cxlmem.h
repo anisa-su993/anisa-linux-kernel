@@ -7,7 +7,7 @@
 #include <linux/cdev.h>
 #include <linux/uuid.h>
 #include <linux/node.h>
-#include <linux/xarray.h>
+#include <linux/list.h>
 #include <cxl/event.h>
 #include <cxl/mailbox.h>
 #include "cxl.h"
@@ -504,7 +504,7 @@ static inline struct cxl_dev_state *mbox_to_cxlds(struct cxl_mailbox *cxl_mbox)
  * @active_volatile_bytes: sum of hard + soft volatile
  * @active_persistent_bytes: sum of hard + soft persistent
  * @dcd_supported: all DCD commands are supported
- * @pending_extents: array of extents pending during more bit processing
+ * @pending_ctx: pending_add ctx
  * @event: event log driver state
  * @poison: poison driver state info
  * @security: security driver state info
@@ -525,7 +525,10 @@ struct cxl_memdev_state {
 	u64 active_volatile_bytes;
 	u64 active_persistent_bytes;
 	bool dcd_supported;
-	struct xarray pending_extents;
+	struct pending_add_ctx {
+		struct list_head pending_extents;
+		struct region_extent *region_extent;
+	} add_ctx;
 
 	struct cxl_event_state event;
 	struct cxl_poison_state poison;

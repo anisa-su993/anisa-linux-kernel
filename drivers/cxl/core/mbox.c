@@ -5,6 +5,7 @@
 #include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/unaligned.h>
+#include <linux/list.h>
 #include <cxlpci.h>
 #include <cxlmem.h>
 #include <cxl.h>
@@ -1160,12 +1161,12 @@ static int send_one_response(struct cxl_mailbox *cxl_mbox,
 }
 
 static int cxl_send_dc_response(struct cxl_memdev_state *mds, int opcode,
-				struct xarray *extent_array, int cnt)
+				struct list_head *extent_list, int cnt)
 {
 	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
 	struct cxl_mbox_dc_response *p;
+	struct cxl_extent_list_node *pos, *tmp;
 	struct cxl_extent *extent;
-	unsigned long index;
 	u32 pl_index;
 
 	size_t pl_size = struct_size(p, extent_list, cnt);
@@ -1187,7 +1188,8 @@ static int cxl_send_dc_response(struct cxl_memdev_state *mds, int opcode,
 		return send_one_response(cxl_mbox, response, opcode, 0, 0);
 
 	pl_index = 0;
-	xa_for_each(extent_array, index, extent) {
+	list_for_each_entry_safe(pos, tmp, extent_list, list) {
+		extent = pos->extent;
 		response->extent_list[pl_index].dpa_start = extent->start_dpa;
 		response->extent_list[pl_index].length = extent->length;
 		pl_index++;
@@ -1214,29 +1216,49 @@ static int cxl_send_dc_response(struct cxl_memdev_state *mds, int opcode,
 	return send_one_response(cxl_mbox, response, opcode, pl_index, 0);
 }
 
+static void delete_extent_node(struct cxl_extent_list_node *node)
+{
+	list_del(&node->list);
+	kfree(node->extent);
+	kfree(node);
+}
+
 void memdev_release_extent(struct cxl_memdev_state *mds, struct range *range)
 {
 	struct device *dev = mds->cxlds.dev;
-	struct xarray extent_list;
-
-	struct cxl_extent extent = {
-		.start_dpa = cpu_to_le64(range->start),
-		.length = cpu_to_le64(range_len(range)),
-	};
+	struct cxl_extent_list_node *node;
+	LIST_HEAD(extent_list);
 
 	dev_dbg(dev, "Release response dpa %pra\n", range);
 
-	xa_init(&extent_list);
-	if (xa_insert(&extent_list, 0, &extent, GFP_KERNEL)) {
-		dev_dbg(dev, "Failed to release %pra\n", range);
-		goto destroy;
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return;
+
+	node->extent = kzalloc(sizeof(*node->extent), GFP_KERNEL);
+	if (!node->extent) {
+		kfree(node);
+		return;
 	}
+
+	node->extent->start_dpa = cpu_to_le64(range->start);
+	node->extent->length = cpu_to_le64(range_len(range));
+	list_add_tail(&node->list, &extent_list);
 
 	if (cxl_send_dc_response(mds, CXL_MBOX_OP_RELEASE_DC, &extent_list, 1))
 		dev_dbg(dev, "Failed to release %pra\n", range);
 
-destroy:
-	xa_destroy(&extent_list);
+	delete_extent_node(node);
+}
+
+static void clear_pending_extents(void *_mds)
+{
+	struct cxl_memdev_state *mds = _mds;
+	struct cxl_extent_list_node *pos, *tmp;
+
+	list_for_each_entry_safe(pos, tmp, &mds->add_ctx.pending_extents, list) {
+                delete_extent_node(pos);
+        }
 }
 
 static int validate_add_extent(struct cxl_memdev_state *mds,
@@ -1254,12 +1276,13 @@ static int validate_add_extent(struct cxl_memdev_state *mds,
 static int cxl_add_pending(struct cxl_memdev_state *mds)
 {
 	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent_list_node *pos, *tmp;
 	struct cxl_extent *extent;
 	unsigned long cnt = 0;
-	unsigned long index;
 	int rc;
 
-	xa_for_each(&mds->pending_extents, index, extent) {
+	list_for_each_entry_safe(pos, tmp, &mds->add_ctx.pending_extents, list) {
+		extent = pos->extent;
 		if (validate_add_extent(mds, extent)) {
 			/*
 			 * Any extents which are to be rejected are omitted from
@@ -1269,18 +1292,14 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 			dev_dbg(dev, "unconsumed DC extent DPA:%#llx LEN:%#llx\n",
 				le64_to_cpu(extent->start_dpa),
 				le64_to_cpu(extent->length));
-			xa_erase(&mds->pending_extents, index);
-			kfree(extent);
+			delete_extent_node(pos);
 			continue;
 		}
 		cnt++;
 	}
 	rc = cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
-				  &mds->pending_extents, cnt);
-	xa_for_each(&mds->pending_extents, index, extent) {
-		xa_erase(&mds->pending_extents, index);
-		kfree(extent);
-	}
+				  &mds->add_ctx.pending_extents, cnt);
+	clear_pending_extents(mds);
 	return rc;
 }
 
@@ -1288,17 +1307,18 @@ static int handle_add_event(struct cxl_memdev_state *mds,
 			    struct cxl_event_dcd *event)
 {
 	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent_list_node *node;
 	struct cxl_extent *extent;
 
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
 	extent = kmemdup(&event->extent, sizeof(*extent), GFP_KERNEL);
 	if (!extent)
 		return -ENOMEM;
 
-	if (xa_insert(&mds->pending_extents, (unsigned long)extent, extent,
-		      GFP_KERNEL)) {
-		kfree(extent);
-		return -ENOMEM;
-	}
+	node->extent = extent;
+	list_add_tail(&node->list, &mds->add_ctx.pending_extents);
 
 	if (event->flags & CXL_DCD_EVENT_MORE) {
 		dev_dbg(dev, "more bit set; delay the surfacing of extent\n");
@@ -2019,17 +2039,6 @@ int cxl_mailbox_init(struct cxl_mailbox *cxl_mbox, struct device *host)
 }
 EXPORT_SYMBOL_NS_GPL(cxl_mailbox_init, "CXL");
 
-static void clear_pending_extents(void *_mds)
-{
-	struct cxl_memdev_state *mds = _mds;
-	struct cxl_extent *extent;
-	unsigned long index;
-
-	xa_for_each(&mds->pending_extents, index, extent)
-		kfree(extent);
-	xa_destroy(&mds->pending_extents);
-}
-
 struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev)
 {
 	struct cxl_memdev_state *mds;
@@ -2047,7 +2056,7 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev)
 	mds->cxlds.cxl_mbox.host = dev;
 	mds->cxlds.reg_map.resource = CXL_RESOURCE_NONE;
 	mds->cxlds.type = CXL_DEVTYPE_CLASSMEM;
-	xa_init(&mds->pending_extents);
+	INIT_LIST_HEAD(&mds->add_ctx.pending_extents);
 	rc = devm_add_action_or_reset(dev, clear_pending_extents, mds);
 	if (rc)
 		return ERR_PTR(rc);
