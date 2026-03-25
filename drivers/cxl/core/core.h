@@ -56,6 +56,7 @@ u64 cxl_dpa_to_hpa(struct cxl_region *cxlr, const struct cxl_memdev *cxlmd,
 		   u64 dpa);
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
+int online_region_extent(struct region_extent *region_extent);
 #else
 static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 				 const struct cxl_memdev *cxlmd, u64 dpa)
@@ -68,6 +69,10 @@ static inline int cxl_add_extent(struct cxl_memdev_state *mds,
 }
 static inline int cxl_rm_extent(struct cxl_memdev_state *mds,
 				struct cxl_extent *extent)
+{
+	return 0;
+}
+static inline int online_region_extent(struct region_extent *region_extent)
 {
 	return 0;
 }

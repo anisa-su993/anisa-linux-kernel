@@ -85,7 +85,7 @@ alloc_region_extent(struct cxl_dax_region *cxlr_dax, struct range *hpa_range,
 	return no_free_ptr(region_extent);
 }
 
-static int online_region_extent(struct region_extent *region_extent)
+int online_region_extent(struct region_extent *region_extent)
 {
 	struct cxl_dax_region *cxlr_dax = region_extent->cxlr_dax;
 	struct device *dev = &region_extent->dev;
@@ -260,62 +260,63 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	return 0;
 }
 
-static int cxlr_add_extent(struct cxl_dax_region *cxlr_dax,
+static int cxlr_add_extent(struct cxl_memdev_state *mds,
+			   struct cxl_dax_region *cxlr_dax,
 			   struct cxl_endpoint_decoder *cxled,
 			   struct cxled_extent *ed_extent)
-{
-	struct region_extent *region_extent;
-	struct range hpa_range;
-	int rc;
+ {
+	struct region_extent **reg_ext;
+ 	struct range hpa_range;
+ 	int rc;
 
-	calc_hpa_range(cxled, cxlr_dax, &ed_extent->dpa_range, &hpa_range);
+ 	calc_hpa_range(cxled, cxlr_dax, &ed_extent->dpa_range, &hpa_range);
 
-	region_extent = cxlr_dax->region_extent;
-	if (region_extent) {
-		/* Add decoder extent to existing region extent */
-		rc = xa_insert(&region_extent->decoder_extents,
-			       ed_extent->dpa_range.start, ed_extent,
-			       GFP_KERNEL);
-		if (rc) {
-			kfree(ed_extent);
-			return rc;
-		}
-		region_extent->hpa_range.start = min(region_extent->hpa_range.start,
-						     hpa_range.start);
-		region_extent->hpa_range.end = max(region_extent->hpa_range.end,
-						   hpa_range.end);
-		return 0;
-	}
+	reg_ext = &mds->add_ctx.region_extent;
+	if (*reg_ext) {
+ 		/* Add decoder extent to existing region extent */
+		dev_dbg(&cxlr_dax->dev,
+			"Append decoder extent to region extent\n");
+		rc = xa_insert(&(*reg_ext)->decoder_extents,
+ 			       ed_extent->dpa_range.start, ed_extent,
+ 			       GFP_KERNEL);
+ 		if (rc) {
+ 			kfree(ed_extent);
+ 			return rc;
+ 		}
+		(*reg_ext)->hpa_range.start = min((*reg_ext)->hpa_range.start,
+ 						     hpa_range.start);
+		(*reg_ext)->hpa_range.end = max((*reg_ext)->hpa_range.end,
+ 						   hpa_range.end);
+ 		return 0;
+ 	}
 
-	/* First decoder extent - create new region extent */
-	region_extent = alloc_region_extent(cxlr_dax, &hpa_range, &ed_extent->uuid);
-	if (IS_ERR(region_extent)) {
-		kfree(ed_extent);
-		return PTR_ERR(region_extent);
-	}
+ 	/* First decoder extent - create new region extent */
+	dev_dbg(&cxlr_dax->dev, "Alloc new region_extent\n");
+	mds->add_ctx.region_extent = alloc_region_extent(cxlr_dax,
+							 &hpa_range,
+							 &ed_extent->uuid);
+	if (IS_ERR(*reg_ext)) {
+ 		kfree(ed_extent);
+		return PTR_ERR(*reg_ext);
+ 	}
 
-	rc = xa_insert(&region_extent->decoder_extents,
-		       ed_extent->dpa_range.start, ed_extent, GFP_KERNEL);
-	if (rc) {
-		free_region_extent(region_extent);
-		kfree(ed_extent);
-		return rc;
-	}
+	rc = xa_insert(&(*reg_ext)->decoder_extents,
+ 		       ed_extent->dpa_range.start, ed_extent, GFP_KERNEL);
+ 	if (rc) {
+		free_region_extent(*reg_ext);
+ 		kfree(ed_extent);
+ 		return rc;
+ 	}
 
-	/* device model handles freeing region_extent */
-	rc = online_region_extent(region_extent);
-	if (rc)
-		return rc;
-
-	cxlr_dax->region_extent = region_extent;
-	return 0;
-}
+ 	return 0;
+ }
 
 /* Callers are expected to ensure cxled has been attached to a region */
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
+	struct region_extent *pending_region_ext = mds->add_ctx.region_extent;
 	struct cxl_endpoint_decoder *cxled;
 	struct range ed_range, ext_range;
 	struct cxl_dax_region *cxlr_dax;
@@ -333,7 +334,19 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	if (!cxlr)
 		return -ENXIO;
 
-	cxlr_dax = cxled->cxld.region->cxlr_dax;
+	cxlr_dax = cxlr->cxlr_dax;
+	/* Cannot add to a region_extent once it's been onlined */
+	if (cxlr_dax->region_extent) {
+		dev_err(&cxlr_dax->dev, "Can no longer add to region %d\n",
+			cxlr->id);
+		return -EINVAL;
+	}
+
+	if (pending_region_ext &&
+	    !uuid_equal((uuid_t *)extent->uuid, &pending_region_ext->uuid)) {
+		return -EINVAL;
+	}
+
 	dev = &cxled->cxld.dev;
 	ed_range = (struct range) {
 		.start = cxled->dpa_res->start,
@@ -374,5 +387,5 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 
 	dev_dbg(dev, "Add extent %pra (%pU)\n", &ed_extent->dpa_range, &ed_extent->uuid);
 
-	return cxlr_add_extent(cxlr_dax, cxled, ed_extent);
+	return cxlr_add_extent(mds, cxlr_dax, cxled, ed_extent);
 }
