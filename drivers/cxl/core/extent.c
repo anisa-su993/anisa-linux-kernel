@@ -167,65 +167,16 @@ static void calc_hpa_range(struct cxl_endpoint_decoder *cxled,
 	hpa_range->end = hpa_range->start + range_len(dpa_range) - 1;
 }
 
-static void recalc_hpa_range(struct region_extent *re)
-{
-	struct cxled_extent *ed_extent;
-	struct range hpa_range;
-	unsigned long index;
-	bool first = true;
-
-	xa_for_each(&re->decoder_extents, index, ed_extent) {
-		calc_hpa_range(ed_extent->cxled, re->cxlr_dax,
-			       &ed_extent->dpa_range, &hpa_range);
-		if (first) {
-			re->hpa_range = hpa_range;
-			first = false;
-		} else {
-			re->hpa_range.start = min(re->hpa_range.start,
-						  hpa_range.start);
-			re->hpa_range.end = max(re->hpa_range.end,
-						hpa_range.end);
-		}
-	}
-}
-
-static void cxlr_rm_decoder_extents(struct cxl_dax_region *cxlr_dax,
-				    struct cxl_endpoint_decoder *cxled,
-				    struct range *dpa_range)
-{
-	struct region_extent *re = cxlr_dax->region_extent;
-	struct cxled_extent *ed_extent;
-	unsigned long index;
-
-	if (!re)
-		return;
-
-	xa_for_each(&re->decoder_extents, index, ed_extent) {
-		if (ed_extent->cxled == cxled &&
-		    range_overlaps(&ed_extent->dpa_range, dpa_range)) {
-			dev_dbg(&re->dev, "Remove decoder extent %pra\n",
-				&ed_extent->dpa_range);
-			xa_erase(&re->decoder_extents, index);
-			cxled_release_extent(cxled, ed_extent);
-		}
-	}
-
-	if (xa_empty(&re->decoder_extents)) {
-		dev_dbg(&re->dev, "Remove region extent HPA %pra\n",
-			&re->hpa_range);
-		region_rm_extent(re);
-	} else {
-		recalc_hpa_range(re);
-	}
-}
-
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
 	struct cxl_endpoint_decoder *cxled;
-	struct range dpa_range;
+	struct range dpa_range, hpa_range;
+	struct cxl_dax_region *cxlr_dax;
+	struct region_extent *reg_ext;
 	struct cxl_region *cxlr;
+	uuid_t tag;
 
 	dpa_range = (struct range) {
 		.start = start_dpa,
@@ -256,7 +207,34 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 		return -ENXIO;
 	}
 
-	cxlr_rm_decoder_extents(cxlr->cxlr_dax, cxled, &dpa_range);
+	cxlr_dax = cxlr->cxlr_dax;
+	reg_ext = cxlr_dax->region_extent;
+	if (!reg_ext) {
+		dev_err(&cxlr->cxlr_dax->dev,
+			"no capacity has been added to the region\n");
+		return -ENXIO;
+	}
+
+	import_uuid(&tag, extent->uuid);
+	if (!uuid_equal(&tag, &reg_ext->uuid)) {
+		dev_err(&cxlr->cxlr_dax->dev,
+			"extent tag %pU doesn't match region tag %pU\n",
+			&tag, &reg_ext->uuid);
+		return -EINVAL;
+	}
+
+	calc_hpa_range(cxled, cxlr_dax, &dpa_range, &hpa_range);
+	if (!range_contains(&reg_ext->hpa_range, &hpa_range)) {
+		dev_err(&cxlr_dax->dev,
+			"extent HPA %pra exceeds region HPA %pra\n",
+			&hpa_range, &reg_ext->hpa_range);
+		return -EINVAL;
+	}
+
+	/* Release entire capacity of the region */
+	region_rm_extent(reg_ext);
+	cxlr_dax->region_extent = NULL;
+
 	return 0;
 }
 
