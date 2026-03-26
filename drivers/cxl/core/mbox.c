@@ -1982,13 +1982,20 @@ static int __cxl_process_extent_list(struct cxl_endpoint_decoder *cxled)
 			dev_dbg(dev, "Processing extent %d/%d\n",
 				current_index + i, total_expected);
 
-			rc = validate_add_extent(mds, extent);
-			if (rc)
+			rc = add_to_pending_list(&mds->add_ctx.pending_extents,
+						 extent);
+			if (rc) {
 				latched_rc = rc;
+			}
 		}
 
 		current_index += nr_returned;
 	} while (total_expected > total_read);
+
+	if (!latched_rc && !list_empty(&mds->add_ctx.pending_extents)) {
+		latched_rc = cxl_add_pending(mds);
+	}
+	clear_pending_extents(mds);
 
 	return latched_rc;
 }
