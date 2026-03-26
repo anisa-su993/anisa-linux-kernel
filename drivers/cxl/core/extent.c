@@ -30,7 +30,7 @@ static void free_region_extent(struct region_extent *region_extent)
 	xa_for_each(&region_extent->decoder_extents, index, ed_extent)
 		cxled_release_extent(ed_extent->cxled, ed_extent);
 	xa_destroy(&region_extent->decoder_extents);
-	ida_free(&region_extent->cxlr_dax->extent_ida, region_extent->dev.id);
+	region_extent->cxlr_dax->region_extent = NULL;
 	kfree(region_extent);
 }
 
@@ -72,21 +72,15 @@ static struct region_extent *
 alloc_region_extent(struct cxl_dax_region *cxlr_dax, struct range *hpa_range,
 		    uuid_t *uuid)
 {
-	int id;
-
 	struct region_extent *region_extent __free(kfree) =
 				kzalloc(sizeof(*region_extent), GFP_KERNEL);
 	if (!region_extent)
 		return ERR_PTR(-ENOMEM);
 
-	id = ida_alloc(&cxlr_dax->extent_ida, GFP_KERNEL);
-	if (id < 0)
-		return ERR_PTR(-ENOMEM);
-
 	region_extent->hpa_range = *hpa_range;
 	region_extent->cxlr_dax = cxlr_dax;
 	uuid_copy(&region_extent->uuid, uuid);
-	region_extent->dev.id = id;
+	region_extent->dev.id = 0;
 	xa_init(&region_extent->decoder_extents);
 	return no_free_ptr(region_extent);
 }
@@ -121,80 +115,42 @@ err:
 	return rc;
 }
 
-struct match_data {
-	struct cxl_endpoint_decoder *cxled;
-	struct range *new_range;
-};
-
-static int match_contains(struct device *dev, const void *data)
-{
-	struct region_extent *region_extent = to_region_extent(dev);
-	const struct match_data *md = data;
-	struct cxled_extent *entry;
-	unsigned long index;
-
-	if (!region_extent)
-		return 0;
-
-	xa_for_each(&region_extent->decoder_extents, index, entry) {
-		if (md->cxled == entry->cxled &&
-		    range_contains(&entry->dpa_range, md->new_range))
-			return 1;
-	}
-	return 0;
-}
-
 static bool extents_contain(struct cxl_dax_region *cxlr_dax,
 			    struct cxl_endpoint_decoder *cxled,
 			    struct range *new_range)
 {
-	struct match_data md = {
-		.cxled = cxled,
-		.new_range = new_range,
-	};
-
-	struct device *extent_device __free(put_device)
-			= device_find_child(&cxlr_dax->dev, &md, match_contains);
-	if (!extent_device)
-		return false;
-
-	return true;
-}
-
-static int match_overlaps(struct device *dev, const void *data)
-{
-	struct region_extent *region_extent = to_region_extent(dev);
-	const struct match_data *md = data;
+	struct region_extent *re = cxlr_dax->region_extent;
 	struct cxled_extent *entry;
 	unsigned long index;
 
-	if (!region_extent)
-		return 0;
+	if (!re)
+		return false;
 
-	xa_for_each(&region_extent->decoder_extents, index, entry) {
-		if (md->cxled == entry->cxled &&
-		    range_overlaps(&entry->dpa_range, md->new_range))
-			return 1;
+	xa_for_each(&re->decoder_extents, index, entry) {
+		if (cxled == entry->cxled &&
+		    range_contains(&entry->dpa_range, new_range))
+			return true;
 	}
-
-	return 0;
+	return false;
 }
 
 static bool extents_overlap(struct cxl_dax_region *cxlr_dax,
 			    struct cxl_endpoint_decoder *cxled,
 			    struct range *new_range)
 {
-	struct match_data md = {
-		.cxled = cxled,
-		.new_range = new_range,
-	};
+	struct region_extent *re = cxlr_dax->region_extent;
+	struct cxled_extent *entry;
+	unsigned long index;
 
-	struct device *extent_device __free(put_device)
-			= device_find_child(&cxlr_dax->dev, &md, match_overlaps);
-	if (!extent_device)
+	if (!re)
 		return false;
 
-	return true;
+	xa_for_each(&re->decoder_extents, index, entry) {
+		if (cxled == entry->cxled &&
+		    range_overlaps(&entry->dpa_range, new_range))
+			return true;
+	}
+	return false;
 }
 
 static void calc_hpa_range(struct cxl_endpoint_decoder *cxled,
@@ -211,21 +167,56 @@ static void calc_hpa_range(struct cxl_endpoint_decoder *cxled,
 	hpa_range->end = hpa_range->start + range_len(dpa_range) - 1;
 }
 
-static int cxlr_rm_extent(struct device *dev, void *data)
+static void recalc_hpa_range(struct region_extent *re)
 {
-	struct region_extent *region_extent = to_region_extent(dev);
-	struct range *region_hpa_range = data;
+	struct cxled_extent *ed_extent;
+	struct range hpa_range;
+	unsigned long index;
+	bool first = true;
 
-	if (!region_extent)
-		return 0;
-
-	/* Any extent which 'touches' the released range is removed. */
-	if (range_overlaps(region_hpa_range, &region_extent->hpa_range)) {
-		dev_dbg(dev, "Remove region extent HPA %pra\n",
-			&region_extent->hpa_range);
-		region_rm_extent(region_extent);
+	xa_for_each(&re->decoder_extents, index, ed_extent) {
+		calc_hpa_range(ed_extent->cxled, re->cxlr_dax,
+			       &ed_extent->dpa_range, &hpa_range);
+		if (first) {
+			re->hpa_range = hpa_range;
+			first = false;
+		} else {
+			re->hpa_range.start = min(re->hpa_range.start,
+						  hpa_range.start);
+			re->hpa_range.end = max(re->hpa_range.end,
+						hpa_range.end);
+		}
 	}
-	return 0;
+}
+
+static void cxlr_rm_decoder_extents(struct cxl_dax_region *cxlr_dax,
+				    struct cxl_endpoint_decoder *cxled,
+				    struct range *dpa_range)
+{
+	struct region_extent *re = cxlr_dax->region_extent;
+	struct cxled_extent *ed_extent;
+	unsigned long index;
+
+	if (!re)
+		return;
+
+	xa_for_each(&re->decoder_extents, index, ed_extent) {
+		if (ed_extent->cxled == cxled &&
+		    range_overlaps(&ed_extent->dpa_range, dpa_range)) {
+			dev_dbg(&re->dev, "Remove decoder extent %pra\n",
+				&ed_extent->dpa_range);
+			xa_erase(&re->decoder_extents, index);
+			cxled_release_extent(cxled, ed_extent);
+		}
+	}
+
+	if (xa_empty(&re->decoder_extents)) {
+		dev_dbg(&re->dev, "Remove region extent HPA %pra\n",
+			&re->hpa_range);
+		region_rm_extent(re);
+	} else {
+		recalc_hpa_range(re);
+	}
 }
 
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
@@ -233,7 +224,7 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
 	struct cxl_endpoint_decoder *cxled;
-	struct range hpa_range, dpa_range;
+	struct range dpa_range;
 	struct cxl_region *cxlr;
 
 	dpa_range = (struct range) {
@@ -265,11 +256,8 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 		return -ENXIO;
 	}
 
-	calc_hpa_range(cxled, cxlr->cxlr_dax, &dpa_range, &hpa_range);
-
-	/* Remove region extents which overlap */
-	return device_for_each_child(&cxlr->cxlr_dax->dev, &hpa_range,
-				     cxlr_rm_extent);
+	cxlr_rm_decoder_extents(cxlr->cxlr_dax, cxled, &dpa_range);
+	return 0;
 }
 
 static int cxlr_add_extent(struct cxl_dax_region *cxlr_dax,
@@ -282,14 +270,32 @@ static int cxlr_add_extent(struct cxl_dax_region *cxlr_dax,
 
 	calc_hpa_range(cxled, cxlr_dax, &ed_extent->dpa_range, &hpa_range);
 
+	region_extent = cxlr_dax->region_extent;
+	if (region_extent) {
+		/* Add decoder extent to existing region extent */
+		rc = xa_insert(&region_extent->decoder_extents,
+			       ed_extent->dpa_range.start, ed_extent,
+			       GFP_KERNEL);
+		if (rc) {
+			kfree(ed_extent);
+			return rc;
+		}
+		region_extent->hpa_range.start = min(region_extent->hpa_range.start,
+						     hpa_range.start);
+		region_extent->hpa_range.end = max(region_extent->hpa_range.end,
+						   hpa_range.end);
+		return 0;
+	}
+
+	/* First decoder extent - create new region extent */
 	region_extent = alloc_region_extent(cxlr_dax, &hpa_range, &ed_extent->uuid);
 	if (IS_ERR(region_extent)) {
 		kfree(ed_extent);
 		return PTR_ERR(region_extent);
 	}
 
-	rc = xa_insert(&region_extent->decoder_extents, (unsigned long)ed_extent,
-		       ed_extent, GFP_KERNEL);
+	rc = xa_insert(&region_extent->decoder_extents,
+		       ed_extent->dpa_range.start, ed_extent, GFP_KERNEL);
 	if (rc) {
 		free_region_extent(region_extent);
 		kfree(ed_extent);
@@ -297,7 +303,12 @@ static int cxlr_add_extent(struct cxl_dax_region *cxlr_dax,
 	}
 
 	/* device model handles freeing region_extent */
-	return online_region_extent(region_extent);
+	rc = online_region_extent(region_extent);
+	if (rc)
+		return rc;
+
+	cxlr_dax->region_extent = region_extent;
+	return 0;
 }
 
 /* Callers are expected to ensure cxled has been attached to a region */
