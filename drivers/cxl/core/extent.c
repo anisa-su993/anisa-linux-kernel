@@ -231,7 +231,7 @@ static void calc_hpa_range(struct cxl_endpoint_decoder *cxled,
 	hpa_range->end = hpa_range->start + range_len(dpa_range) - 1;
 }
 
-static int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
 			      struct region_extent *region_extent)
 {
 	struct device *dev = &cxlr->cxlr_dax->dev;

@@ -1377,6 +1377,16 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 	if (rc)
 		return rc;
 
+	rc = cxlr_notify_extent(pending_reg_ext->cxlr_dax->cxlr,
+				DCD_ADD_CAPACITY,
+				pending_reg_ext);
+	/*
+	 * The region device was briefly live but DAX layer ensures it was not
+	 * used
+	 */
+	if (rc)
+		region_rm_extent(pending_reg_ext);
+
 	/* Restore remaining extents to original order and send rsp */
 	list_sort(NULL, &mds->add_ctx.pending_extents, idx_compare);
 	return cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
