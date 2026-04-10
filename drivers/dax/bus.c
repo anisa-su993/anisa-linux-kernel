@@ -68,7 +68,8 @@ static int dax_match_type(const struct dax_device_driver *dax_drv, struct device
 	enum dax_driver_type type = DAXDRV_DEVICE_TYPE;
 	struct dev_dax *dev_dax = to_dev_dax(dev);
 
-	if (dev_dax->region->res.flags & IORESOURCE_DAX_KMEM)
+	if (dev_dax->region->res.flags & IORESOURCE_DAX_KMEM &&
+	    !(dev_dax->region->res.flags & IORESOURCE_DAX_SPARSE_CAP))
 		type = DAXDRV_KMEM_TYPE;
 
 	if (dax_drv->type == type)
