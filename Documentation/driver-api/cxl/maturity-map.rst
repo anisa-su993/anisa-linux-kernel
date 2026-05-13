@@ -148,7 +148,7 @@ Memory-pooling
 --------------
 
 * [1] Hotplug of LDs (via PCI hotplug)
-* [0] Dynamic Capacity Device (DCD) Support
+* [1] Dynamic Capacity Device (DCD) Support
 
 Multi-host sharing
 ------------------
