@@ -654,6 +654,171 @@ from HPA to DPA.  This is why they must be aware of the entire interleave set.
 Linux does not support unbalanced interleave configurations.  As a result, all
 endpoints in an interleave set must have the same ways and granularity.
 
+Dynamic Capacity Extents
+========================
+
+A `Dynamic Capacity Device (DCD)` advertises capacity in `DC partitions`
+and surfaces individual chunks of that capacity to the host as `extents`.
+The device may add an extent at any time (a `pending add`) and may
+request that a previously accepted extent be released (a `pending
+release`).  Each transition is mediated by a mailbox handshake whose
+state machine the CXL driver enforces in
+:code:`drivers/cxl/core/{mbox.c,extent.c}`.
+
+Extents that share a non-null tag form one logical allocation.  Each
+surviving member becomes its own :code:`struct dc_extent` (per-extent
+sysfs device, per-extent HPA range); their containing tag group is an
+internal-only :code:`struct cxl_dc_tag_group` keyed by UUID with no
+sysfs identity.  Each :code:`dc_extent` becomes one
+:code:`dax_resource` on the DAX side, and a tagged DAX device is built
+by claiming every :code:`dax_resource` that carries the tag.
+
+For DAX-side semantics — how accepted extents materialize into
+:code:`dax_resource` objects and DAX devices — see
+:doc:`dax-driver`.
+
+Accepting Extents
+-----------------
+Extents are made available to the host from the device through DC ADD events.
+Event records contain extents, which may be tagged or untagged, shared or
+not shared. Multiple event records can by chained together by the `More` flag.
+
+The unit of allocation is a `tag`.  All extents
+sharing a tag form one allocation; the More flag is a delivery boundary
+only, meaning when the More chain ends, the host can assume that all extents
+have been collected for each tag.
+A tag may be the null UUID (an `untagged` allocation, valid in
+non-sharable regions) or a non-null UUID identifying a sharable or
+non-sharable allocation.
+
+When a `More`-terminated chain of pending adds closes, the driver
+processes the pending list one tag group at a time.  A group is
+committed only if it passes every gate below; failing any gate drops
+the entire group with a firmware-bug warning, and the dropped extents
+do not appear in the :code:`ADD_DC_RESPONSE`.  There is no
+partial-extent acceptance — either an offered extent is accepted whole
+or it is dropped whole.
+
+Per-extent gates (applied in :code:`cxl_add_extent`,
+:code:`drivers/cxl/core/extent.c`):
+
+* The extent's DPA range must resolve to a CXL region via
+  :code:`cxl_dpa_to_region()`.  An extent with no owning region is
+  dropped; the device sees the omission from :code:`ADD_DC_RESPONSE`.
+* The extent's DPA range must be `fully contained` in the endpoint
+  decoder's DPA range.  An extent that straddles the decoder boundary
+  is rejected with :code:`-ENXIO`; the driver never clips an extent to
+  fit.
+* The extent must not overlap an extent already present in the same
+  region.  Overlap classification is done in
+  :code:`cxlr_dax_classify_extent()` using :code:`range_overlaps()`.
+  Exact duplicates of a previously-accepted range are tolerated —
+  accepting the same range twice is a no-op, which simplifies
+  probe-time scans of the device's existing accepted list.
+
+Per-group gates (applied in :code:`cxl_add_pending`,
+:code:`drivers/cxl/core/mbox.c`):
+
+* `Host-wide tag uniqueness`: a non-null tag must not already
+  correspond to a live :code:`cxl_dc_tag_group` anywhere on this host.
+  The orchestrator (FM) owns tag-UUID allocation per spec; the
+  registry in :code:`drivers/cxl/core/extent.c`
+  (:code:`cxl_tag_register` / :code:`cxl_tag_already_committed`)
+  catches firmware bugs and orchestrator misbehavior across every
+  region and memdev.  Skipped for the null UUID, which has no
+  cross-chain identity.
+* `Sequence-number integrity`: every member must carry the wire
+  field :code:`shared_extn_seq == 0` (non-sharable allocation), or
+  the group's sorted sequence numbers must be exactly
+  :code:`0, 1, …, n-1` (sharable allocation).  Mixed, gapped,
+  duplicate, or sets that do not start at 0 are rejected.
+* `Partition equality`: every tagged extent in the group must
+  resolve to the same DC partition.  A single allocation cannot span
+  partitions because CDAT describes sharable / writable / coherency
+  attributes per-partition.  Skipped for the null UUID.
+* `Alignment`: every extent's :code:`start_dpa` and :code:`length`
+  must be :code:`PMD_SIZE`-aligned.  Partial acceptance
+  of an aligned subset would leave an unusable DAX device, so the
+  group is dropped instead.
+
+Surviving extents are sorted by the wire field
+:code:`shared_extn_seq` — stable, so arrival order is preserved for
+the all-zero non-sharable case — and each becomes a
+:code:`dc_extent` inserted into a fresh :code:`cxl_dc_tag_group`
+keyed by the group's UUID.  Each :code:`dc_extent` carries its own
+:code:`hpa_range`; the tag group itself has no aggregate range.
+
+As each surviving extent is attached the host assigns it a 0..n-1
+:code:`seq_num`: for sharable allocations this equals the
+device-stamped :code:`shared_extn_seq` directly; for non-sharable
+allocations the device sends :code:`shared_extn_seq == 0` and the
+host fills in the arrival-order position (assigned in
+:code:`cxl_realize_group`).  The DAX layer enforces the same
+:code:`0..n-1` dense invariant in both cases.
+
+The tag group is brought online via :code:`online_tag_group()`,
+which registers every member :code:`dc_extent` as an
+:code:`extentX.Y` child of :code:`cxlr_dax->dev`, the DAX layer is
+notified with :code:`DCD_ADD_CAPACITY`, and the accepted extents are
+spliced into the response list for a single :code:`ADD_DC_RESPONSE`
+mailbox per More-chain.
+
+Releasing Extents
+-----------------
+
+A release may be initiated by the device (a Release Capacity event) or
+by the host (when destroying a DAX device or tearing down a region).
+The host-initiated paths tear a tag group down directly through
+:code:`rm_tag_group()`; the device-initiated path goes through the
+release chain in :code:`drivers/cxl/core/mbox.c`.
+
+A device-initiated release may span several event records stitched
+together by the More flag, exactly like an add.  Each record is staged
+in :code:`mds->rel_ctx` by :code:`handle_release_event()`, and nothing
+happens until the chain closes (More clear).  A chain whose closing
+record never arrives is dropped by a 20 second watchdog without a
+response, so the capacity stays with the host and the device may retry.
+
+When the chain closes, :code:`cxl_rm_pending()` validates it as a
+whole before touching anything:
+
+* Each extent is resolved by :code:`cxl_resolve_extent()` to its CXL
+  region, endpoint decoder and :code:`cxl_dc_tag_group`, keyed by DPA
+  range, tag (UUID) and, on a sharable partition, shared extent
+  sequence, because the device, not the host, supplies the identity.
+  A chain entry names the :code:`dc_extent` that contains its range;
+  the host cannot split an extent, so a release of part of one
+  releases the whole extent.
+* An extent whose DPA range resolves to no region, or to a region
+  whose :code:`cxlr_dax` is not set up, holds no capacity on this host
+  (for example, an extent left over from a host crash that has not yet
+  been re-claimed, or a duplicate release racing region teardown).  It
+  is acknowledged via :code:`memdev_release_extent()` and otherwise
+  ignored.
+* An extent that resolves to a live :code:`cxlr_dax` but matches no
+  :code:`dc_extent` refuses the entire chain: nothing is torn down and
+  nothing is acknowledged, so the device retains the capacity and may
+  retry.
+* Every tag group the chain names must be named in full
+  (:code:`cxl_group_fully_named()`).  Partial release is not
+  supported; a chain naming only part of a group is refused the same
+  way.
+
+Only once the whole chain checks out are the named groups torn down,
+one at a time, by :code:`cxl_release_tag_group()`: the backing
+memregion is invalidated once for the group, the DAX layer is notified
+with :code:`DCD_RELEASE_CAPACITY` and consulted for permission, and if
+it agrees :code:`rm_tag_group()` unregisters every member
+:code:`dc_extent` device, which cascades through the DAX layer to drop
+the corresponding :code:`dax_resource`\ s.  If the DAX layer returns
+:code:`-EBUSY` (the capacity is still mapped or otherwise in use) that
+group and any after it in the chain stay intact for the device to
+retry.
+
+Acknowledgment is per extent: unregistering a :code:`dc_extent` sends
+a Release Dynamic Capacity command for it, so a group is acknowledged
+exactly when it is gone and never before.
+
 Example Configurations
 ======================
 .. toctree::
