@@ -1824,9 +1824,23 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 			list_for_each_entry_safe(pos, tmp, &group, list)
 				delete_extent_node(pos);
 		} else {
-			/* Keep accepted extents for the response */
-			list_splice_tail_init(&group, &accepted);
-			total_accepted += group_cnt;
+			rc = cxlr_notify_extent(tag_group->cxlr_dax->cxlr,
+						DCD_ADD_CAPACITY, tag_group);
+			if (rc) {
+				/*
+				 * The dax-side notification failed; the tag
+				 * group was torn down by rm_tag_group().  Drop
+				 * the extents so we do not mis-report
+				 * acceptance to the device.
+				 */
+				rm_tag_group(tag_group);
+				list_for_each_entry_safe(pos, tmp, &group, list)
+					delete_extent_node(pos);
+			} else {
+				/* Keep accepted extents for the response */
+				list_splice_tail_init(&group, &accepted);
+				total_accepted += group_cnt;
+			}
 		}
 
 		/* Next tag's group gets a fresh add_ctx slot */
