@@ -28,6 +28,7 @@ cxled_to_mds(struct cxl_endpoint_decoder *cxled)
 	return container_of(cxlds, struct cxl_memdev_state, cxlds);
 }
 
+int cxl_process_extent_list(struct cxl_endpoint_decoder *cxled);
 int cxl_region_invalidate_memregion(struct cxl_region *cxlr);
 
 #ifdef CONFIG_CXL_REGION
@@ -72,6 +73,9 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 bool cxl_tag_already_committed(const uuid_t *tag);
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
 int online_tag_group(struct cxl_dc_tag_group *group);
+void rm_tag_group(struct cxl_dc_tag_group *group);
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+		       struct cxl_dc_tag_group *group);
 #else
 static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 				 const struct cxl_memdev *cxlmd, u64 dpa)
@@ -95,6 +99,13 @@ static inline int online_tag_group(struct cxl_dc_tag_group *group)
 static inline bool cxl_tag_already_committed(const uuid_t *tag)
 {
 	return false;
+}
+static inline void rm_tag_group(struct cxl_dc_tag_group *group) { }
+static inline int cxlr_notify_extent(struct cxl_region *cxlr,
+				     enum dc_event event,
+				     struct cxl_dc_tag_group *group)
+{
+	return 0;
 }
 static inline
 struct cxl_region *cxl_dpa_to_region(const struct cxl_memdev *cxlmd, u64 dpa,

@@ -63,7 +63,6 @@ static const struct attribute_group dc_extent_attribute_group = {
 
 __ATTRIBUTE_GROUPS(dc_extent_attribute);
 
-
 static void cxled_release_extent(struct cxl_endpoint_decoder *cxled,
 				 struct dc_extent *dc_extent)
 {
@@ -168,7 +167,7 @@ static void dc_extent_unregister(void *ext)
 	device_unregister(&dc_extent->dev);
 }
 
-static void rm_tag_group(struct cxl_dc_tag_group *group)
+void rm_tag_group(struct cxl_dc_tag_group *group)
 {
 	struct device *region_dev = &group->cxlr_dax->dev;
 	struct dc_extent *dc_extent;
@@ -362,6 +361,36 @@ static void calc_hpa_range(struct cxl_endpoint_decoder *cxled,
 	hpa_range->end = hpa_range->start + range_len(dpa_range) - 1;
 }
 
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+		       struct cxl_dc_tag_group *group)
+{
+	struct device *dev = &cxlr->cxlr_dax->dev;
+	struct cxl_notify_data notify_data;
+	struct cxl_driver *driver;
+
+	dev_dbg(dev, "Trying notify: type %d tag %pUb\n", event, &group->uuid);
+
+	guard(device)(dev);
+
+	/*
+	 * The lack of a driver indicates a notification has failed.  No user
+	 * space coordination was possible.
+	 */
+	if (!dev->driver)
+		return 0;
+	driver = to_cxl_drv(dev->driver);
+	if (!driver->notify)
+		return 0;
+
+	notify_data = (struct cxl_notify_data) {
+		.event = event,
+		.group = group,
+	};
+
+	dev_dbg(dev, "Notify: type %d tag %pUb\n", event, &group->uuid);
+	return driver->notify(dev, &notify_data);
+}
+
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
@@ -374,6 +403,7 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	struct range dpa_range;
 	unsigned long idx;
 	uuid_t tag;
+	int rc;
 
 	dpa_range = (struct range) {
 		.start = start_dpa,
@@ -430,6 +460,16 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 		return -EINVAL;
 	}
 
+	rc = cxlr_notify_extent(cxlr, DCD_RELEASE_CAPACITY, group);
+	if (rc) {
+		/*
+		 * dax layer refused (-EBUSY) or failed (-ENOMEM, etc.).  Do
+		 * not proceed to tear down the tag group — leave its
+		 * dax_resources alive so we do not free them out from under
+		 * live dev_dax ranges.  The device will retry the release.
+		 */
+		return 0;
+	}
 
 	/* Release the entire tag group */
 	rm_tag_group(group);
