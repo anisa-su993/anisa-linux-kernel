@@ -17,7 +17,7 @@ static int __cxl_dax_add_resource(struct dax_region *dax_region,
 	length = range_len(&dc_extent->hpa_range);
 	return dax_region_add_resource(dax_region, dev, start, length,
 				       &dc_extent->group->uuid,
-				       dc_extent->shared_extn_seq);
+				       dc_extent->seq_num);
 }
 
 static int cxl_dax_add_resource(struct device *dev, void *data)

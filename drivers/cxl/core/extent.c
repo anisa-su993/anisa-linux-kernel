@@ -87,7 +87,7 @@ static void dc_extent_release(struct device *dev)
 
 	cxled_release_extent(dc_extent->cxled, dc_extent);
 	xa_erase(&group->cxlr_dax->dc_extents, dc_extent->dev.id);
-	xa_erase(&group->dc_extents, dc_extent->shared_extn_seq);
+	xa_erase(&group->dc_extents, dc_extent->seq_num);
 	group->nr_extents--;
 	if (!group->nr_extents)
 		free_tag_group(group);
@@ -163,7 +163,7 @@ static void cleanup_pending_dc_extent(struct dc_extent *dc_extent)
 	struct cxl_dc_tag_group *group = dc_extent->group;
 
 	cxled_release_extent(dc_extent->cxled, dc_extent);
-	xa_erase(&group->dc_extents, dc_extent->shared_extn_seq);
+	xa_erase(&group->dc_extents, dc_extent->seq_num);
 	group->nr_extents--;
 	if (!group->nr_extents)
 		free_tag_group(group);
@@ -440,18 +440,17 @@ static int cxlr_add_extent(struct cxl_memdev_state *mds,
 	dc_extent->group = *group;
 
 	/*
-	 * Key by shared_extn_seq so iteration order = assembly order.
-	 * Sharable groups have unique 1..n seqs (cxl_check_group_seq);
-	 * non-sharable groups carry seq 0 and the group is expected to be
-	 * a single extent.  A collision here signals a cxl-side validation
-	 * gap.
+	 * Key by @seq_num so iteration order equals assembly order, in both
+	 * the sharable case (device-stamped 1..n) and the non-sharable case
+	 * (host-assigned arrival-order 1..n).  A collision here signals a
+	 * cxl-side validation gap.
 	 */
-	rc = xa_insert(&(*group)->dc_extents, dc_extent->shared_extn_seq,
+	rc = xa_insert(&(*group)->dc_extents, dc_extent->seq_num,
 		       dc_extent, GFP_KERNEL);
 	if (rc) {
 		dev_WARN_ONCE(&cxlr_dax->dev, rc == -EBUSY,
-			"duplicate shared_extn_seq %u in tag %pUb\n",
-			dc_extent->shared_extn_seq, &dc_extent->uuid);
+			"duplicate seq_num %u in tag %pUb\n",
+			dc_extent->seq_num, &dc_extent->uuid);
 		kfree(dc_extent);
 		return rc;
 	}
@@ -460,7 +459,8 @@ static int cxlr_add_extent(struct cxl_memdev_state *mds,
 }
 
 /* Callers are expected to ensure cxled has been attached to a region */
-int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
+int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
+		   u16 seq_num)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
@@ -529,7 +529,7 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	dc_extent->cxled = cxled;
 	dc_extent->dpa_range = ext_range;
 	dc_extent->hpa_range = hpa_range;
-	dc_extent->shared_extn_seq = le16_to_cpu(extent->shared_extn_seq);
+	dc_extent->seq_num = seq_num;
 	import_uuid(&dc_extent->uuid, extent->uuid);
 
 	dev_dbg(dev, "Add extent %pra (%pU)\n", &dc_extent->dpa_range,

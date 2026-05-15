@@ -65,7 +65,8 @@ struct cxl_region *cxl_dpa_to_region(const struct cxl_memdev *cxlmd, u64 dpa,
 				     struct cxl_endpoint_decoder **cxled);
 u64 cxl_dpa_to_hpa(struct cxl_region *cxlr, const struct cxl_memdev *cxlmd,
 		   u64 dpa);
-int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
+int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
+		   u16 seq_num);
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
 int online_tag_group(struct cxl_dc_tag_group *group);
 void rm_tag_group(struct cxl_dc_tag_group *group);
@@ -78,7 +79,8 @@ static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 	return ULLONG_MAX;
 }
 static inline int cxl_add_extent(struct cxl_memdev_state *mds,
-				   struct cxl_extent *extent) {
+				 struct cxl_extent *extent, u16 seq_num)
+{
 	return 0;
 }
 static inline int cxl_rm_extent(struct cxl_memdev_state *mds,

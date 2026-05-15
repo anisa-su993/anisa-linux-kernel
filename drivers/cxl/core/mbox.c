@@ -1771,14 +1771,30 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 		/*
 		 * (5) Validate + attach in seq order.  Surviving nodes stay
 		 * on @group in seq order; failed nodes are removed.
+		 *
+		 * Assemble-order index (@logical_seq) increments per iteration
+		 * including failures, so the dc_extents handed to the dax
+		 * layer carry contiguous 1..n in the success case and a gap
+		 * (which the dax-side density check catches and refuses) when
+		 * an extent is dropped here.  For sharable extents the device
+		 * already stamped 1..n into shared_extn_seq and we use that
+		 * directly; for non-sharable extents the device leaves seq=0
+		 * and we use @logical_seq instead, giving the dax layer one
+		 * uniform 1..n invariant to check.
 		 */
+		u16 logical_seq = 1;
 		list_for_each_entry_safe(pos, tmp, &group, list) {
+			u16 raw = le16_to_cpu(pos->extent->shared_extn_seq);
+			u16 seq = raw ? raw : logical_seq;
+
+			logical_seq++;
+
 			if (cxl_validate_extent(mds, pos)) {
 				delete_extent_node(pos);
 				continue;
 			}
 
-			if (cxl_add_extent(mds, pos->extent)) {
+			if (cxl_add_extent(mds, pos->extent, seq)) {
 				dev_dbg(dev,
 					"Tag %pUb: failed to add extent DPA:%#llx LEN:%#llx\n",
 					&tag,

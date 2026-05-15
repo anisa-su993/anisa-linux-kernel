@@ -409,9 +409,13 @@ struct cxl_dc_tag_group;
  * @hpa_range: HPA range that @dpa_range decodes to, relative to
  *	       cxlr_dax->hpa_range.start.
  * @uuid: tag uuid (matches @group->uuid; kept for the release-path log).
- * @shared_extn_seq: per-allocation sequence number (CXL 3.1 Table 8-51);
- *		     0 for non-sharable allocations, 1..n within a sharable
- *		     tag group.
+ * @seq_num: 1..n assembly-order index within the tag group.  For extents
+ *	     from a sharable partition this equals the device-stamped
+ *	     shared_extn_seq (CXL 3.1 Table 8-51).  For extents from a
+ *	     non-sharable partition the device leaves shared_extn_seq == 0
+ *	     and the host assigns @seq_num in event arrival order at
+ *	     cxl_add_pending() time.  Used by the dax layer to assemble
+ *	     ranges in the right order regardless of source.
  */
 struct dc_extent {
 	struct device dev;
@@ -420,7 +424,7 @@ struct dc_extent {
 	struct range dpa_range;
 	struct range hpa_range;
 	uuid_t uuid;
-	u16 shared_extn_seq;
+	u16 seq_num;
 };
 
 /**
@@ -674,13 +678,14 @@ struct cxl_dax_region {
  * group has no sysfs identity; userspace sees the individual dc_extents
  * directly under the parent dax_region device.  The group exists to
  * keep tag-scoped invariants (atomic add, atomic release, ordered carve
- * by shared_extn_seq) in one place.
+ * by seq_num) in one place.
  *
  * @cxlr_dax: back reference to parent region device.
  * @uuid: tag identifying this allocation; same across all member dc_extents.
- * @dc_extents: xarray of &struct dc_extent in this group, indexed by
- *		shared_extn_seq.  For non-sharable single-extent allocations
- *		the key is 0; for sharable allocations the keys are 1..n.
+ * @dc_extents: xarray of &struct dc_extent in this group, indexed by the
+ *		dc_extent's @seq_num (1..n, dense).  See &struct dc_extent
+ *		for how seq_num is sourced for sharable vs non-sharable
+ *		allocations.
  * @nr_extents: live count of dc_extents in the group; the group is freed
  *		when the last dc_extent device is released.
  */

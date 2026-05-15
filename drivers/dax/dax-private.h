@@ -123,9 +123,13 @@ void run_dax(struct dax_device *dax_dev);
  * @region: dax_region this resources is in
  * @res: resource
  * @uuid: tag identifying the backing extent; zero uuid means untagged
- * @shared_extn_seq: per-allocation sequence number (CXL 3.1 Table 8-51);
- *		     0 for untagged or non-sharable, 1..n within a sharable
- *		     tag group.  Used to order claims in uuid_store().
+ * @seq_num: 1..n assembly-order index within the tag group; 0 for the
+ *	     untagged pool (uuid == 0).  For extents from a sharable
+ *	     CXL DC partition this is the device-stamped shared_extn_seq
+ *	     (CXL 3.1 Table 8-51).  For extents from a non-sharable
+ *	     partition the cxl layer fills it in event arrival order, so
+ *	     the dax layer can rely on a single 1..n dense invariant when
+ *	     it claims a tagged group in uuid_store().
  * @use_cnt: count the number of uses of this resource
  *
  * Changes to the dax_region and the dax_resources within it are protected by
@@ -137,7 +141,7 @@ struct dax_resource {
 	struct dax_region *region;
 	struct resource *res;
 	uuid_t uuid;
-	u16 shared_extn_seq;
+	u16 seq_num;
 	unsigned int use_cnt;
 };
 
@@ -148,7 +152,7 @@ struct dax_resource {
  */
 int dax_region_add_resource(struct dax_region *dax_region, struct device *dev,
 			    resource_size_t start, resource_size_t length,
-			    const uuid_t *tag, u16 shared_extn_seq);
+			    const uuid_t *tag, u16 seq_num);
 int dax_region_rm_resource(struct dax_region *dax_region,
 			   struct device *dev);
 int dax_region_rm_resources(struct dax_region *dax_region,

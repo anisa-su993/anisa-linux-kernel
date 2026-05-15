@@ -211,7 +211,7 @@ static void dax_release_resource(void *res)
 int dax_region_add_resource(struct dax_region *dax_region,
 			    struct device *device,
 			    resource_size_t start, resource_size_t length,
-			    const uuid_t *tag, u16 shared_extn_seq)
+			    const uuid_t *tag, u16 seq_num)
 {
 	struct resource *new_resource;
 	int rc;
@@ -234,7 +234,7 @@ int dax_region_add_resource(struct dax_region *dax_region,
 	dev_dbg(dax_region->dev, "add resource %pr\n", new_resource);
 	dax_resource->region = dax_region;
 	dax_resource->res = new_resource;
-	dax_resource->shared_extn_seq = shared_extn_seq;
+	dax_resource->seq_num = seq_num;
 	if (tag)
 		uuid_copy(&dax_resource->uuid, tag);
 
@@ -1389,9 +1389,9 @@ static int dax_resource_seq_cmp(const void *a, const void *b)
 	const struct dax_resource * const *pa = a;
 	const struct dax_resource * const *pb = b;
 
-	if ((*pa)->shared_extn_seq < (*pb)->shared_extn_seq)
+	if ((*pa)->seq_num < (*pb)->seq_num)
 		return -1;
-	if ((*pa)->shared_extn_seq > (*pb)->shared_extn_seq)
+	if ((*pa)->seq_num > (*pb)->seq_num)
 		return 1;
 	return 0;
 }
@@ -1707,15 +1707,19 @@ static ssize_t uuid_claim_tagged(struct dax_region *dax_region,
 	sort(c.arr, c.count, sizeof(*c.arr), dax_resource_seq_cmp, NULL);
 
 	/*
-	 * Sharable tag groups must form an exact 1..n sequence (CXL 3.1
-	 * Table 8-51).  The cxl layer enforces this on surface; a
-	 * violation here means a cxl-side validation gap.
+	 * Tagged groups carry a dense 1..n @seq_num regardless of source
+	 * (sharable: device-stamped; non-sharable: host-assigned in
+	 * arrival order — see &struct dax_resource).  A gap or
+	 * out-of-range value here means an extent went missing on the
+	 * cxl side (e.g. a per-extent failure in cxl_add_pending) or a
+	 * cxl-side validation gap; in either case refuse the whole
+	 * group rather than carve a partial allocation.
 	 */
 	for (i = 0; i < c.count; i++) {
-		if (c.arr[i]->shared_extn_seq != i + 1) {
+		if (c.arr[i]->seq_num != i + 1) {
 			dev_WARN_ONCE(dax_region->dev, 1,
 				"tag %pUb seq invariant violated at slot %u (got %u)\n",
-				uuid, i, c.arr[i]->shared_extn_seq);
+				uuid, i, c.arr[i]->seq_num);
 			rc = -EINVAL;
 			goto out;
 		}
