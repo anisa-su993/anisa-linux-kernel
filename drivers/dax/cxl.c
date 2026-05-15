@@ -128,9 +128,9 @@ static int cxl_dax_region_probe(struct device *dev)
 		nid = memory_add_physaddr_to_nid(cxlr_dax->hpa_range.start);
 
 	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A)
-		flags |= IORESOURCE_DAX_SPARSE_CAP;
+		flags = IORESOURCE_DAX_SPARSE_CAP;
 	else
-		flags |= IORESOURCE_DAX_KMEM;  /* static RAM defaults to kmem */
+		flags = IORESOURCE_DAX_KMEM;  /* static RAM defaults to kmem */
 
 	dax_region = alloc_dax_region(dev, cxlr->id, &cxlr_dax->hpa_range, nid,
 				      PMD_SIZE, flags, &sparse_ops);
