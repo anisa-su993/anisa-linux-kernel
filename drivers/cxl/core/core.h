@@ -67,6 +67,7 @@ int devm_cxl_add_pmem_region(struct cxl_region *cxlr);
 
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		   u16 seq_num);
+bool cxl_tag_already_committed(const uuid_t *tag);
 int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
 int online_tag_group(struct cxl_dc_tag_group *group, bool skip_release);
 #else
@@ -89,6 +90,10 @@ static inline int online_tag_group(struct cxl_dc_tag_group *group,
 				   bool skip_release)
 {
 	return 0;
+}
+static inline bool cxl_tag_already_committed(const uuid_t *tag)
+{
+	return false;
 }
 static inline
 struct cxl_region *cxl_dpa_to_region(const struct cxl_memdev *cxlmd, u64 dpa,
