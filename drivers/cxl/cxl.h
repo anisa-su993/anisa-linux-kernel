@@ -617,6 +617,8 @@ struct cxl_dax_region {
  *		allocations.
  * @nr_extents: live count of dc_extents in the group; the group is freed
  *		when the last dc_extent device is released.
+ * @registry_node: anchor in the host-wide non-null-tag registry that
+ *		enforces tag uuid uniqueness across all regions and memdevs.
  * @skip_device_release: tear the group down without sending a Release DC
  *		command to the device.  Set when rejecting a group whose
  *		extents this host never accepted, so they are omitted from the
@@ -628,6 +630,7 @@ struct cxl_dc_tag_group {
 	uuid_t uuid;
 	struct xarray dc_extents;
 	unsigned int nr_extents;
+	struct list_head registry_node;
 	bool skip_device_release;
 };
 
