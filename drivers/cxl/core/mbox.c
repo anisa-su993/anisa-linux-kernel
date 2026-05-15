@@ -1399,53 +1399,6 @@ static void extract_tag_group(struct list_head *pending,
 }
 
 /*
- * Detect a tagged allocation re-appearing after its More-chain closed.
- *
- * A More-chain (the sequence of Add-Capacity events terminated by
- * More=0) guarantees completeness for every tag it carries: once the
- * chain ends, no extent bearing a tag that appeared inside it may
- * arrive in any later chain.  This is true for tagged extents whether
- * or not they carry shared_extn_seq — sequencing is a sharable-region
- * concern, completeness is a general one.
- *
- * Detection here is a linear walk of cxlr_dax->dc_extents (keyed by
- * allocator-assigned IDs, not by UUID) comparing each stored
- * dc_extent's containing tag against the incoming tag.
- *
- * Returns true iff @tag is non-null AND a dc_extent whose tag group
- * uuid matches already exists on the target region.  For an untagged
- * (null-UUID) extent the check is skipped: the spec is silent on
- * aggregating untagged extents across More-chains, so we don't
- * manufacture a rule here.
- */
-static bool cxl_tag_already_committed(struct cxl_memdev_state *mds,
-				      struct cxl_extent *extent,
-				      const uuid_t *tag)
-{
-	u64 start_dpa = le64_to_cpu(extent->start_dpa);
-	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
-	struct cxl_dax_region *cxlr_dax;
-	struct dc_extent *dce;
-	struct cxl_region *cxlr;
-	unsigned long idx;
-
-	if (uuid_is_null(tag))
-		return false;
-
-	guard(rwsem_read)(&cxl_rwsem.region);
-	cxlr = cxl_dpa_to_region(cxlmd, start_dpa, NULL);
-	if (!cxlr)
-		return false;
-
-	cxlr_dax = cxlr->cxlr_dax;
-	xa_for_each(&cxlr_dax->dc_extents, idx, dce) {
-		if (uuid_equal(&dce->group->uuid, tag))
-			return true;
-	}
-	return false;
-}
-
-/*
  * Validate shared_extn_seq across a tag group already sorted ascending.
  *
  * Per CXL 3.1 Table 8-51, shared_extn_seq is the per-allocation
@@ -1704,17 +1657,17 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 		/*
 		 * (2) Cross-More-chain uniqueness.  A non-null tag seen in
 		 * this group must not already correspond to a committed
-		 * tag group on its target cxlr_dax: More=0 was supposed to
-		 * close that allocation.  Firmware bug — reject the whole
-		 * group.  Any extent in the group maps to the same region
-		 * (same tag == same allocation == same target), so checking
-		 * the first suffices.
+		 * tag group anywhere on this host.  More=0 was supposed to
+		 * close that allocation, and tag uuids must be unique across
+		 * all regions and memdevs (the orchestrator owns assignment
+		 * per spec).  Either constraint failing — same chain
+		 * redelivered, or two distinct allocations colliding on the
+		 * same uuid — is a firmware/orchestrator bug; reject the
+		 * whole group.
 		 */
-		pos = list_first_entry(&group, struct cxl_extent_list_node,
-				       list);
-		if (cxl_tag_already_committed(mds, pos->extent, &tag)) {
+		if (cxl_tag_already_committed(&tag)) {
 			dev_warn(dev,
-				 "Tag %pUb: dropping group, tag already committed in a previous More-chain (firmware bug)\n",
+				 "Tag %pUb: dropping group, tag already committed (firmware/orchestrator bug)\n",
 				 &tag);
 			list_for_each_entry_safe(pos, tmp, &group, list)
 				delete_extent_node(pos);
