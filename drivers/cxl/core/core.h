@@ -84,6 +84,7 @@ int cxl_resolve_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		       struct cxl_dc_tag_group **groupp);
 int cxl_release_tag_group(struct cxl_region *cxlr,
 			  struct cxl_dc_tag_group *group);
+bool cxl_tag_already_committed(const uuid_t *tag);
 int online_tag_group(struct cxl_dc_tag_group *group);
 void rm_tag_group(struct cxl_dc_tag_group *group);
 const struct cxl_dpa_partition *
@@ -122,6 +123,10 @@ static inline int online_tag_group(struct cxl_dc_tag_group *group)
 	return 0;
 }
 static inline void rm_tag_group(struct cxl_dc_tag_group *group) { }
+static inline bool cxl_tag_already_committed(const uuid_t *tag)
+{
+	return false;
+}
 static inline
 struct cxl_region *cxl_dpa_to_region(const struct cxl_memdev *cxlmd, u64 dpa,
 				     struct cxl_endpoint_decoder **cxled)
