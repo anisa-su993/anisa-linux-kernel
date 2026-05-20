@@ -28,6 +28,8 @@ cxled_to_mds(struct cxl_endpoint_decoder *cxled)
 
 #ifdef CONFIG_CXL_REGION
 
+int cxl_region_invalidate_memregion(struct cxl_region *cxlr);
+
 struct cxl_region_context {
 	struct cxl_endpoint_decoder *cxled;
 	struct range hpa_range;
@@ -65,6 +67,7 @@ int devm_cxl_add_pmem_region(struct cxl_region *cxlr);
 
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		   u16 seq_num);
+int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
 int online_tag_group(struct cxl_dc_tag_group *group, bool skip_release);
 #else
 static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
@@ -74,6 +77,11 @@ static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 }
 static inline int cxl_add_extent(struct cxl_memdev_state *mds,
 				 struct cxl_extent *extent, u16 seq_num)
+{
+	return 0;
+}
+static inline int cxl_rm_extent(struct cxl_memdev_state *mds,
+				struct cxl_extent *extent)
 {
 	return 0;
 }
