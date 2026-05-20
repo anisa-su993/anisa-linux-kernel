@@ -7,6 +7,8 @@
 #include <linux/unaligned.h>
 #include <linux/list.h>
 #include <linux/list_sort.h>
+#include <linux/pgtable.h>
+#include <linux/sizes.h>
 #include <cxlpci.h>
 #include <cxlmem.h>
 #include <cxl.h>
@@ -1291,6 +1293,19 @@ static int add_to_pending_list(struct list_head *pending_list,
 }
 
 /*
+ * Extents need to be aligned to dax region's mapping granularity.
+ * Use PMD_SIZE, since cxl_dax_region_probe() calls alloc_dax_region with
+ * PMD_SIZE for the 'align' parameter.
+ */
+static bool cxl_extent_dcd_aligned(const struct cxl_extent *extent)
+{
+	u64 start = le64_to_cpu(extent->start_dpa);
+	u64 len = le64_to_cpu(extent->length);
+
+	return IS_ALIGNED(start, PMD_SIZE) && IS_ALIGNED(len, PMD_SIZE);
+}
+
+/*
  * Compare two extents by shared_extn_seq (ascending).  list_sort is
  * stable, so extents with equal keys keep their arrival order from
  * add_to_pending_list()'s list_add_tail().
@@ -1412,10 +1427,37 @@ static int cxl_realize_group(struct cxl_memdev_state *mds, const uuid_t *tag,
 }
 
 /*
+ * Validate a tag @group before realizing it.  Returns 0 if the group may be
+ * added, or a negative errno if it must be dropped.  Further gates layer in
+ * here in later commits.
+ */
+static int cxl_validate_group(struct cxl_memdev_state *mds, const uuid_t *tag,
+			      struct list_head *group)
+{
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent_list_node *pos;
+
+	/* Alignment gate — drop the group if any member fails */
+	list_for_each_entry(pos, group, list) {
+		if (!cxl_extent_dcd_aligned(pos->extent)) {
+			dev_warn_ratelimited(dev,
+				 "Tag %pUb: dropping group, extent DPA:%#llx LEN:%#llx not %#llx-aligned\n",
+				 tag,
+				 le64_to_cpu(pos->extent->start_dpa),
+				 le64_to_cpu(pos->extent->length),
+				 (u64)PMD_SIZE);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
  * Drive the pending Add-Capacity records through cxl_realize_group(),
  * grouped by tag.  Per group: extract from pending, stable-sort by
- * shared_extn_seq, realize the group, and on success move it onto the
- * accepted list.  Validation gates layer onto this loop in later commits.
+ * shared_extn_seq, validate, realize the group, and on success move it onto
+ * the accepted list.
  */
 static int cxl_add_pending(struct cxl_memdev_state *mds, bool existing)
 {
@@ -1448,6 +1490,11 @@ static int cxl_add_pending(struct cxl_memdev_state *mds, bool existing)
 		 * the stable sort maintains arrival order.
 		 */
 		list_sort(NULL, &group, extent_seq_compare);
+
+		if (cxl_validate_group(mds, &tag, &group)) {
+			drop_extent_group(&group);
+			continue;
+		}
 
 		cnt = cxl_realize_group(mds, &tag, &group, existing);
 		if (cnt < 0) {
