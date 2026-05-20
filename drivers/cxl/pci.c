@@ -509,13 +509,20 @@ static bool cxl_alloc_irq_vectors(struct pci_dev *pdev)
 	return true;
 }
 
-/* Event logs the driver drains: standard logs when native_cxl */
-static u32 cxl_event_drain_mask(struct pci_host_bridge *host_bridge)
+/*
+ * Event logs the driver drains: standard logs when native_cxl, DCD when
+ * supported.
+ */
+static u32 cxl_event_drain_mask(struct pci_host_bridge *host_bridge,
+				struct cxl_memdev_state *mds)
 {
-	if (host_bridge->native_cxl_error)
-		return CXLDEV_EVENT_STATUS_ALL & ~CXLDEV_EVENT_STATUS_DCD;
+	u32 mask = 0;
 
-	return 0;
+	if (host_bridge->native_cxl_error)
+		mask |= CXLDEV_EVENT_STATUS_ALL & ~CXLDEV_EVENT_STATUS_DCD;
+	if (cxl_dcd_supported(mds))
+		mask |= CXLDEV_EVENT_STATUS_DCD;
+	return mask;
 }
 
 static irqreturn_t cxl_event_thread(int irq, void *id)
@@ -525,7 +532,7 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 	struct pci_host_bridge *host_bridge =
 		pci_find_host_bridge(to_pci_dev(cxlds->dev)->bus);
-	u32 mask = cxl_event_drain_mask(host_bridge);
+	u32 mask = cxl_event_drain_mask(host_bridge, mds);
 	u32 status;
 
 	do {
@@ -765,7 +772,7 @@ static int cxl_event_config(struct pci_host_bridge *host_bridge,
 	if (rc)
 		return rc;
 
-	mask = cxl_event_drain_mask(host_bridge);
+	mask = cxl_event_drain_mask(host_bridge, mds);
 	if (mask)
 		cxl_mem_get_event_records(mds, mask);
 
