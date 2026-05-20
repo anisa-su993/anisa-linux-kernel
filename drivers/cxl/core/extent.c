@@ -439,6 +439,91 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 	return cxlr_add_extent(mds, cxlr_dax, dc_extent);
 }
 
+/**
+ * cxl_resolve_extent() - locate the tag group a released extent belongs to
+ * @mds: memdev state
+ * @extent: extent from a DC Release-Capacity record
+ * @groupp: returns the matching tag group
+ *
+ * Pure lookup, no side effects.  A record names the dc_extent that contains
+ * its range: the host cannot split an extent.  The memdev's groups are found
+ * on the host-wide list, so a group stays resolvable while its region is
+ * torn down; the caller holds cxl_rwsem.region for read, which excludes
+ * that teardown, so the group outlives the lookup.
+ *
+ * Return: 0 when @extent matches an extent the host owns.  -ENXIO when the
+ * extent overlaps nothing the host owns, so the release can simply be
+ * acknowledged.  -EINVAL when it overlaps owned capacity without matching
+ * any single host-owned extent: it straddles multiple extents, or the tag
+ * doesn't match.
+ */
+int cxl_resolve_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
+		       struct cxl_dc_tag_group **groupp)
+{
+	u64 start_dpa = le64_to_cpu(extent->start_dpa);
+	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
+	struct cxl_dc_tag_group *group;
+	struct dc_extent *dc_extent;
+	struct range dpa_range;
+	unsigned long idx;
+	uuid_t tag;
+
+	lockdep_assert_held(&cxl_rwsem.region);
+
+	*groupp = NULL;
+
+	dpa_range = (struct range) {
+		.start = start_dpa,
+		.end = start_dpa + le64_to_cpu(extent->length) - 1,
+	};
+	import_uuid(&tag, extent->uuid);
+
+	guard(mutex)(&cxl_dc_group_lock);
+	list_for_each_entry(group, &cxl_dc_groups, node) {
+		if (cxled_to_memdev(group->cxlr_dax->cxled) != cxlmd)
+			continue;
+		xa_for_each(&group->dc_extents, idx, dc_extent) {
+			if (!range_overlaps(&dc_extent->dpa_range, &dpa_range))
+				continue;
+			if (!range_contains(&dc_extent->dpa_range, &dpa_range))
+				return -EINVAL;
+			if (!uuid_equal(&group->uuid, &tag))
+				return -EINVAL;
+			*groupp = group;
+			return 0;
+		}
+	}
+	return -ENXIO;
+}
+
+/**
+ * cxl_release_tag_group() - tear a tag group down for a device release
+ * @group: the group to release
+ *
+ * The caller acknowledges the group to the device as a whole; the group is
+ * dropped without a Release DC of its own.
+ *
+ * Return: 0 when the group is gone, negative when the caller must leave it
+ * intact and let the device retry.
+ */
+int cxl_release_tag_group(struct cxl_dc_tag_group *group)
+{
+	int rc;
+
+	/*
+	 * Invalidate CPU caches for the region before releasing the capacity
+	 * back to the device so it cannot reassign the range while stale
+	 * cached data lingers.  On failure do not release: leave the tag
+	 * group intact and let the device retry.
+	 */
+	rc = cxl_region_invalidate_memregion(group->cxlr_dax->cxlr);
+	if (rc)
+		return rc;
+
+	rm_tag_group(group);
+	return 0;
+}
+
 /*
  * Take @dc_extent out of the group, then drop it in whatever state the
  * online got it to: registered, initialized but not added, or never touched.

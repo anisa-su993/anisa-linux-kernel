@@ -79,6 +79,9 @@ void kill_regions(struct cxl_root_decoder *cxlrd);
 
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		   u16 seq_num);
+int cxl_resolve_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
+		       struct cxl_dc_tag_group **groupp);
+int cxl_release_tag_group(struct cxl_dc_tag_group *group);
 int online_tag_group(struct cxl_dc_tag_group *group);
 void rm_tag_group(struct cxl_dc_tag_group *group);
 void cxl_dax_region_release_groups(struct cxl_dax_region *cxlr_dax);
@@ -95,6 +98,19 @@ static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 
 static inline int cxl_add_extent(struct cxl_memdev_state *mds,
 				 struct cxl_extent *extent, u16 seq_num)
+{
+	return -ENXIO;
+}
+
+static inline int cxl_resolve_extent(struct cxl_memdev_state *mds,
+				     struct cxl_extent *extent,
+				     struct cxl_dc_tag_group **groupp)
+{
+	*groupp = NULL;
+	return -ENXIO;
+}
+
+static inline int cxl_release_tag_group(struct cxl_dc_tag_group *group)
 {
 	return -ENXIO;
 }
