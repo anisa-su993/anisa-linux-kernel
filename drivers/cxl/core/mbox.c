@@ -1713,19 +1713,6 @@ static int handle_add_event(struct cxl_memdev_state *mds,
 	return rc;
 }
 
-static int cxl_rm_extent(struct cxl_memdev_state *mds,
-			 struct cxl_extent *extent)
-{
-	u64 start_dpa = le64_to_cpu(extent->start_dpa);
-	struct range dpa_range = {
-		.start = start_dpa,
-		.end = start_dpa + le64_to_cpu(extent->length) - 1,
-	};
-
-	memdev_release_extent(mds, &dpa_range);
-	return 0;
-}
-
 static const char *cxl_dcd_evt_type_str(u8 type)
 {
 	switch (type) {
