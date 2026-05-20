@@ -7,6 +7,8 @@
 #include <linux/unaligned.h>
 #include <linux/list.h>
 #include <linux/list_sort.h>
+#include <linux/pgtable.h>
+#include <linux/sizes.h>
 #include <cxlpci.h>
 #include <cxlmem.h>
 #include <cxl.h>
@@ -1282,6 +1284,19 @@ static int add_to_pending_list(struct list_head *pending_list,
 }
 
 /*
+ * Extents need to be aligned to dax region's mapping granularity.
+ * Use PMD_SIZE, since cxl_dax_region_probe() calls alloc_dax_region with
+ * PMD_SIZE for the 'align' parameter.
+ */
+static bool cxl_extent_dcd_aligned(const struct cxl_extent *extent)
+{
+	u64 start = le64_to_cpu(extent->start_dpa);
+	u64 len = le64_to_cpu(extent->length);
+
+	return IS_ALIGNED(start, PMD_SIZE) && IS_ALIGNED(len, PMD_SIZE);
+}
+
+/*
  * Compare two extents by shared_extn_seq (ascending).  list_sort is
  * stable, so extents with equal keys keep their arrival order from
  * add_to_pending_list()'s list_add_tail().
@@ -1340,6 +1355,7 @@ static int cxl_add_pending(struct cxl_memdev_state *mds, bool existing)
 
 	while (!list_empty(pending)) {
 		int group_cnt = 0;
+		bool aligned = true;
 		LIST_HEAD(group);
 		struct cxl_dc_tag_group *tag_group;
 		uuid_t tag;
@@ -1357,6 +1373,25 @@ static int cxl_add_pending(struct cxl_memdev_state *mds, bool existing)
 		 * the stable sort maintains arrival order.
 		 */
 		list_sort(NULL, &group, extent_seq_compare);
+
+		/* Alignment gate — abort the group if any member fails */
+		list_for_each_entry(pos, &group, list) {
+			if (!cxl_extent_dcd_aligned(pos->extent)) {
+				dev_warn(dev,
+					 "Tag %pUb: dropping group, extent DPA:%#llx LEN:%#llx not %#llx-aligned\n",
+					 &tag,
+					 le64_to_cpu(pos->extent->start_dpa),
+					 le64_to_cpu(pos->extent->length),
+					 (u64)PMD_SIZE);
+				aligned = false;
+				break;
+			}
+		}
+		if (!aligned) {
+			list_for_each_entry_safe(pos, tmp, &group, list)
+				delete_extent_node(pos);
+			continue;
+		}
 
 		list_for_each_entry_safe(pos, tmp, &group, list) {
 			/*
