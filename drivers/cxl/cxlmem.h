@@ -453,6 +453,31 @@ static inline struct cxl_dev_state *mbox_to_cxlds(struct cxl_mailbox *cxl_mbox)
  * is a defensive watchdog that refuses such a chain with an empty response
  * and drops the staged list.
  */
+/**
+ * struct pending_release_ctx - staged DC Release-Capacity chain
+ * @pending_extents: extents staged from a CXL_DCD_EVENT_MORE chain
+ * @timeout_work: fires when a chain's closing record never arrives
+ * @lock: serialises staging against chain completion
+ * @nr_pending: number of extents currently staged
+ * @armed: a chain is open and @timeout_work is running
+ *
+ * Release, like Add, may arrive as a chain of records stitched together by
+ * CXL_DCD_EVENT_MORE.  The chain is staged here and validated as a whole
+ * before anything is torn down, so a release is all-or-nothing: the extents
+ * named must correspond exactly to entire tag groups.  A chain that names
+ * only part of a group, or mixes valid extents with ones that match nothing,
+ * is refused without a Release-DC response so the device retains the
+ * capacity and can retry.
+ */
+struct pending_release_ctx {
+	struct list_head pending_extents;
+	struct delayed_work timeout_work;
+	/* serialises staging against chain completion */
+	struct mutex lock;
+	unsigned int nr_pending;
+	bool armed;
+};
+
 struct pending_add_ctx {
 	struct list_head pending_extents;
 	struct cxl_dc_tag_group *group;
@@ -502,6 +527,7 @@ struct cxl_memdev_state {
 	u64 active_persistent_bytes;
 	bool dcd_supported;
 	struct pending_add_ctx add_ctx;
+	struct pending_release_ctx rel_ctx;
 
 	struct cxl_event_state event;
 	struct cxl_poison_state poison;

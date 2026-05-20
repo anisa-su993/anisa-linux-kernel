@@ -30,6 +30,8 @@ int cxled_dcd_check(struct cxl_endpoint_decoder *cxled);
 
 #ifdef CONFIG_CXL_REGION
 
+int cxl_region_invalidate_memregion(struct cxl_region *cxlr);
+
 struct cxl_region_context {
 	struct cxl_endpoint_decoder *cxled;
 	struct range hpa_range;
@@ -68,6 +70,13 @@ void kill_regions(struct cxl_root_decoder *cxlrd);
 
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		   u16 seq_num);
+int cxl_resolve_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
+		       struct cxl_region **cxlrp,
+		       struct cxl_dc_tag_group **groupp);
+bool cxl_group_fully_named(struct cxl_dc_tag_group *group,
+			   struct list_head *chain);
+int cxl_release_tag_group(struct cxl_region *cxlr,
+			  struct cxl_dc_tag_group *group);
 int online_tag_group(struct cxl_dc_tag_group *group);
 void rm_tag_group(struct cxl_dc_tag_group *group);
 #else
@@ -80,6 +89,28 @@ static inline int cxl_add_extent(struct cxl_memdev_state *mds,
 				 struct cxl_extent *extent, u16 seq_num)
 {
 	return 0;
+}
+
+static inline int cxl_resolve_extent(struct cxl_memdev_state *mds,
+				     struct cxl_extent *extent,
+				     struct cxl_region **cxlrp,
+				     struct cxl_dc_tag_group **groupp)
+{
+	*cxlrp = NULL;
+	*groupp = NULL;
+	return -ENXIO;
+}
+
+static inline bool cxl_group_fully_named(struct cxl_dc_tag_group *group,
+					 struct list_head *chain)
+{
+	return false;
+}
+
+static inline int cxl_release_tag_group(struct cxl_region *cxlr,
+					struct cxl_dc_tag_group *group)
+{
+	return -ENXIO;
 }
 static inline int online_tag_group(struct cxl_dc_tag_group *group)
 {

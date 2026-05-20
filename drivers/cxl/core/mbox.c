@@ -1219,6 +1219,14 @@ static void clear_pending_extents(void *_mds)
 #define CXL_DC_MAX_PENDING_EXTENTS	100
 
 /*
+ * Distinct tag groups one Release chain may name.  A chain is bounded by
+ * CXL_DC_MAX_PENDING_EXTENTS extents, and the smallest group is one extent,
+ * so this only has to be a sane ceiling for the on-stack arrays in
+ * cxl_rm_pending().  Not spec-defined.
+ */
+#define CXL_MAX_TAG_GROUPS_PER_CHAIN	16
+
+/*
  * Bound on how long the host will wait for a device to finish a
  * multi-record DC_ADD_CAPACITY chain (More=1 ... More=0) before
  * refusing the chain.
@@ -1270,15 +1278,21 @@ static void cxl_cancel_dcd_add_chain_work(void *_mds)
 	cancel_delayed_work_sync(&mds->add_ctx.timeout_work);
 }
 
-static int add_to_pending_list(struct list_head *pending_list,
-			       struct cxl_extent *to_add)
+static void cxl_cancel_dcd_release_chain_work(void *_mds)
 {
-	struct pending_add_ctx *ctx =
-		container_of(pending_list, struct pending_add_ctx, pending_extents);
+	struct cxl_memdev_state *mds = _mds;
+
+	cancel_delayed_work_sync(&mds->rel_ctx.timeout_work);
+}
+
+static int stage_pending_extent(struct list_head *pending_list,
+				unsigned int *nr_pending, struct mutex *lock,
+				struct cxl_extent *to_add)
+{
 	struct cxl_extent_list_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
 	struct cxl_extent *extent;
 
-	lockdep_assert_held(&ctx->lock);
+	lockdep_assert_held(lock);
 
 	if (!node)
 		return -ENOMEM;
@@ -1290,7 +1304,7 @@ static int add_to_pending_list(struct list_head *pending_list,
 
 	node->extent = extent;
 	list_add_tail(&node->list, pending_list);
-	ctx->nr_pending++;
+	(*nr_pending)++;
 	return 0;
 }
 
@@ -1310,7 +1324,7 @@ static bool cxl_extent_dcd_aligned(const struct cxl_extent *extent)
 /*
  * Compare two extents by shared_extn_seq (ascending).  list_sort is
  * stable, so extents with equal keys keep their arrival order from
- * add_to_pending_list()'s list_add_tail().
+ * stage_pending_extent()'s list_add_tail().
  */
 static int extent_seq_compare(void *priv,
 			      const struct list_head *a,
@@ -1652,6 +1666,197 @@ static int cxl_add_pending(struct cxl_memdev_state *mds, bool existing)
 				    pending, total_accepted);
 }
 
+#define CXL_DC_RELEASE_TIMEOUT	(20 * HZ)
+
+static void clear_pending_release_extents(void *_mds)
+{
+	struct cxl_memdev_state *mds = _mds;
+	struct cxl_extent_list_node *pos, *tmp;
+
+	list_for_each_entry_safe(pos, tmp, &mds->rel_ctx.pending_extents, list)
+		delete_extent_node(pos);
+	mds->rel_ctx.nr_pending = 0;
+}
+
+/*
+ * Validate a staged Release chain and, only if the whole chain checks out,
+ * tear the named tag groups down.
+ *
+ * A release is all-or-nothing.  The chain must name entire tag groups: the
+ * host maps a group as a unit and partial release is not supported.  If any
+ * extent resolves to a live region but matches no group, or a group is only
+ * partly named, nothing is torn down and nothing is acknowledged, so the
+ * device keeps the capacity and can retry.
+ *
+ * Acknowledgment is per extent: tearing a group down sends a Release DC for
+ * each member as it is unregistered, so a group is acknowledged exactly when
+ * it is gone and never before.  If teardown stops part way through a chain,
+ * the groups already gone are acknowledged and the rest stay held; the
+ * device's retry then finds only the remaining groups.  Extents the host is
+ * not tracking at all (no region, or no dax region) hold no capacity here and
+ * are acknowledged up front.
+ */
+static int cxl_rm_pending(struct cxl_memdev_state *mds)
+{
+	struct list_head *pending = &mds->rel_ctx.pending_extents;
+	struct cxl_dc_tag_group *groups[CXL_MAX_TAG_GROUPS_PER_CHAIN];
+	struct cxl_region *cxlrs[CXL_MAX_TAG_GROUPS_PER_CHAIN];
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_extent_list_node *pos;
+	unsigned int nr_groups = 0;
+	int i, rc;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+
+	list_for_each_entry(pos, pending, list) {
+		struct cxl_dc_tag_group *group;
+		struct cxl_region *cxlr;
+		struct range r;
+
+		r.start = le64_to_cpu(pos->extent->start_dpa);
+		r.end = r.start + le64_to_cpu(pos->extent->length) - 1;
+
+		rc = cxl_resolve_extent(mds, pos->extent, &cxlr, &group);
+		if (rc == -ENXIO)
+			continue;	/* untracked: acknowledged below */
+
+		if (!group) {
+			dev_warn_ratelimited(dev,
+					     "DC release %pra matches no tag group; holding capacity for retry\n",
+					     &r);
+			return -EINVAL;
+		}
+
+		for (i = 0; i < nr_groups; i++)
+			if (groups[i] == group)
+				break;
+		if (i < nr_groups)
+			continue;
+
+		if (nr_groups == ARRAY_SIZE(groups)) {
+			dev_warn_ratelimited(dev,
+					     "DC release chain spans more than %zu tag groups; holding capacity for retry\n",
+					     ARRAY_SIZE(groups));
+			return -EINVAL;
+		}
+		cxlrs[nr_groups] = cxlr;
+		groups[nr_groups++] = group;
+	}
+
+	/* Every named group must be named in full. */
+	for (i = 0; i < nr_groups; i++) {
+		if (cxl_group_fully_named(groups[i], pending))
+			continue;
+		dev_warn_ratelimited(dev,
+				     "DC release names tag %pUb only in part; holding capacity for retry\n",
+				     &groups[i]->uuid);
+		return -EINVAL;
+	}
+
+	/* Untracked extents: the host holds nothing, tell the device so. */
+	list_for_each_entry(pos, pending, list) {
+		struct cxl_dc_tag_group *group;
+		struct cxl_region *cxlr;
+		struct range r;
+
+		if (cxl_resolve_extent(mds, pos->extent, &cxlr, &group) != -ENXIO)
+			continue;
+		r.start = le64_to_cpu(pos->extent->start_dpa);
+		r.end = r.start + le64_to_cpu(pos->extent->length) - 1;
+		memdev_release_extent(mds, &r);
+	}
+
+	for (i = 0; i < nr_groups; i++) {
+		rc = cxl_release_tag_group(cxlrs[i], groups[i]);
+		if (rc) {
+			/*
+			 * Teardown refused (dax busy, or the cache invalidate
+			 * failed).  Groups already torn down have been
+			 * acknowledged extent by extent; this one and the rest
+			 * stay held for the device to retry.
+			 */
+			dev_dbg(dev, "DC release of tag %pUb deferred: %d\n",
+				&groups[i]->uuid, rc);
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+static void cxl_dc_release_timeout(struct work_struct *work)
+{
+	struct pending_release_ctx *ctx = container_of(to_delayed_work(work),
+						       struct pending_release_ctx,
+						       timeout_work);
+	struct cxl_memdev_state *mds = container_of(ctx,
+						    struct cxl_memdev_state,
+						    rel_ctx);
+	struct device *dev = mds->cxlds.dev;
+
+	guard(mutex)(&ctx->lock);
+
+	/* Same superseded-expiry check as the add watchdog. */
+	if (!ctx->armed || delayed_work_pending(&ctx->timeout_work))
+		return;
+
+	/*
+	 * The closing record never arrived, so the chain cannot be validated.
+	 * Drop it without a response: the capacity stays with the host and the
+	 * device is free to retry the release.
+	 */
+	dev_warn(dev, "DC release chain timed out; holding capacity for retry\n");
+	clear_pending_release_extents(mds);
+	ctx->armed = false;
+}
+
+static int handle_release_event(struct cxl_memdev_state *mds,
+				struct cxl_event_dcd *event)
+{
+	struct pending_release_ctx *ctx = &mds->rel_ctx;
+	struct device *dev = mds->cxlds.dev;
+	int rc;
+
+	guard(mutex)(&ctx->lock);
+
+	if (ctx->nr_pending >= CXL_DC_MAX_PENDING_EXTENTS) {
+		dev_warn(dev, "DC release chain exceeds %u extents; dropping (firmware bug)\n",
+			 CXL_DC_MAX_PENDING_EXTENTS);
+		clear_pending_release_extents(mds);
+		ctx->armed = false;
+		cancel_delayed_work(&ctx->timeout_work);
+		return -ENOSPC;
+	}
+
+	rc = stage_pending_extent(&ctx->pending_extents, &ctx->nr_pending,
+				  &ctx->lock, &event->extent);
+	if (rc) {
+		clear_pending_release_extents(mds);
+		ctx->armed = false;
+		cancel_delayed_work(&ctx->timeout_work);
+		return rc;
+	}
+
+	if (event->flags & CXL_DCD_EVENT_MORE) {
+		dev_dbg(dev, "more bit set; delay the release of extent\n");
+		mod_delayed_work(system_wq, &ctx->timeout_work,
+				 CXL_DC_RELEASE_TIMEOUT);
+		ctx->armed = true;
+		return 0;
+	}
+
+	/*
+	 * Chain is closing.  Disarm before flushing so a pending watchdog
+	 * (queued but blocked on @ctx->lock) sees !armed and bails out.
+	 */
+	ctx->armed = false;
+	cancel_delayed_work(&ctx->timeout_work);
+
+	rc = cxl_rm_pending(mds);
+	clear_pending_release_extents(mds);
+	return rc;
+}
+
 static int handle_add_event(struct cxl_memdev_state *mds,
 			    struct cxl_event_dcd *event)
 {
@@ -1668,7 +1873,8 @@ static int handle_add_event(struct cxl_memdev_state *mds,
 		return -ENOSPC;
 	}
 
-	rc = add_to_pending_list(&ctx->pending_extents, &event->extent);
+	rc = stage_pending_extent(&ctx->pending_extents, &ctx->nr_pending,
+				  &ctx->lock, &event->extent);
 	if (rc) {
 		clear_pending_extents(mds);
 
@@ -1710,19 +1916,6 @@ static int handle_add_event(struct cxl_memdev_state *mds,
 	return rc;
 }
 
-static int cxl_rm_extent(struct cxl_memdev_state *mds,
-			 struct cxl_extent *extent)
-{
-	u64 start_dpa = le64_to_cpu(extent->start_dpa);
-	struct range dpa_range = {
-		.start = start_dpa,
-		.end = start_dpa + le64_to_cpu(extent->length) - 1,
-	};
-
-	memdev_release_extent(mds, &dpa_range);
-	return 0;
-}
-
 static const char *cxl_dcd_evt_type_str(u8 type)
 {
 	switch (type) {
@@ -1760,7 +1953,7 @@ static void cxl_handle_dcd_event_records(struct cxl_memdev_state *mds,
 		rc = handle_add_event(mds, event);
 		break;
 	case DCD_RELEASE_CAPACITY:
-		rc = cxl_rm_extent(mds, &event->extent);
+		rc = handle_release_event(mds, event);
 		break;
 	case DCD_FORCED_CAPACITY_RELEASE:
 		dev_err_ratelimited(dev, "Forced release event ignored.\n");
@@ -2466,6 +2659,10 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev, u64 serial,
 	mutex_init(&mds->add_ctx.lock);
 	INIT_DELAYED_WORK(&mds->add_ctx.timeout_work,
 			  cxl_dc_add_timeout);
+	INIT_LIST_HEAD(&mds->rel_ctx.pending_extents);
+	mutex_init(&mds->rel_ctx.lock);
+	INIT_DELAYED_WORK(&mds->rel_ctx.timeout_work,
+			  cxl_dc_release_timeout);
 
 	rc = devm_add_action_or_reset(dev, clear_pending_extents, mds);
 	if (rc)
@@ -2477,6 +2674,16 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev, u64 serial,
 	 * cleanup runs with the watchdog guaranteed not to refire.
 	 */
 	rc = devm_add_action_or_reset(dev, cxl_cancel_dcd_add_chain_work, mds);
+	if (rc)
+		return ERR_PTR(rc);
+
+	rc = devm_add_action_or_reset(dev, clear_pending_release_extents, mds);
+	if (rc)
+		return ERR_PTR(rc);
+
+	/* Ordered against the list cleanup exactly as the add chain is. */
+	rc = devm_add_action_or_reset(dev, cxl_cancel_dcd_release_chain_work,
+				      mds);
 	if (rc)
 		return ERR_PTR(rc);
 

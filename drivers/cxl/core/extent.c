@@ -365,6 +365,160 @@ static void dc_extent_unregister(void *ext)
 	device_unregister(&dc_extent->dev);
 }
 
+/* shared_extn_seq is reserved outside sharable partitions (CXL r4.0 Table 8-230) */
+static bool cxled_seq_matters(struct cxl_endpoint_decoder *cxled)
+{
+	struct cxl_dev_state *cxlds = cxled_to_memdev(cxled)->cxlds;
+
+	return cxlds->part[cxled->part].shareable;
+}
+
+/**
+ * cxl_resolve_extent() - locate the tag group a released extent belongs to
+ * @mds: memdev state
+ * @extent: extent from a DC Release-Capacity record
+ * @cxlrp: returns the region owning the DPA, or NULL if untracked
+ * @groupp: returns the matching tag group, or NULL if none
+ *
+ * Pure lookup, no side effects: the caller validates the whole chain before
+ * anything is torn down.
+ *
+ * Return: 0 on a successful lookup (with *@groupp possibly NULL), -ENXIO if
+ * the host is not tracking this DPA at all (no region, or no dax region).
+ * The latter is not an error for the chain: the host holds no capacity for
+ * it, so it can simply be acknowledged.
+ */
+int cxl_resolve_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
+		       struct cxl_region **cxlrp,
+		       struct cxl_dc_tag_group **groupp)
+{
+	u64 start_dpa = le64_to_cpu(extent->start_dpa);
+	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
+	struct cxl_endpoint_decoder *cxled;
+	struct cxl_dax_region *cxlr_dax;
+	struct dc_extent *dc_extent;
+	struct cxl_region *cxlr;
+	struct range dpa_range;
+	unsigned long idx;
+	bool seq_matters;
+	uuid_t tag;
+
+	*cxlrp = NULL;
+	*groupp = NULL;
+
+	dpa_range = (struct range) {
+		.start = start_dpa,
+		.end = start_dpa + le64_to_cpu(extent->length) - 1,
+	};
+
+	cxlr = cxl_dpa_to_region(cxlmd, start_dpa, &cxled);
+	if (!cxlr)
+		return -ENXIO;
+
+	cxlr_dax = cxlr->cxlr_dax;
+	if (!cxlr_dax)
+		return -ENXIO;
+
+	*cxlrp = cxlr;
+	import_uuid(&tag, extent->uuid);
+	seq_matters = cxled_seq_matters(cxled);
+
+	/* RCU keeps entries live during the walk; teardown happens later. */
+	scoped_guard(rcu) {
+		xa_for_each(&cxlr_dax->dc_extents, idx, dc_extent) {
+			if (dc_extent->cxled != cxled)
+				continue;
+			if (!range_contains(&dc_extent->dpa_range, &dpa_range))
+				continue;
+			if (!uuid_equal(&dc_extent->group->uuid, &tag))
+				continue;
+			if (seq_matters && dc_extent->seq_num !=
+			    le16_to_cpu(extent->shared_extn_seq))
+				continue;
+			*groupp = dc_extent->group;
+			return 0;
+		}
+	}
+	return 0;
+}
+
+/**
+ * cxl_group_fully_named() - does @chain name every extent of @group?
+ * @group: host-side tag group
+ * @chain: staged release chain
+ *
+ * Partial release is not supported: a release must name a whole tag group.
+ * Compare as a set — the device is free to order a chain however it likes.
+ * A chain entry names the dc_extent that contains its range; the host cannot
+ * split an extent, so a release of part of one releases the whole extent.
+ *
+ * Return: true when every extent of @group is named by @chain.
+ */
+bool cxl_group_fully_named(struct cxl_dc_tag_group *group,
+			   struct list_head *chain)
+{
+	struct cxl_extent_list_node *pos;
+	struct dc_extent *dc_extent;
+	unsigned long idx;
+	unsigned int named = 0;
+
+	scoped_guard(rcu) {
+		xa_for_each(&group->dc_extents, idx, dc_extent) {
+			bool seq_matters = cxled_seq_matters(dc_extent->cxled);
+			bool found = false;
+
+			list_for_each_entry(pos, chain, list) {
+				struct range r = {
+					.start = le64_to_cpu(pos->extent->start_dpa),
+				};
+
+				r.end = r.start +
+					le64_to_cpu(pos->extent->length) - 1;
+				if (!range_contains(&dc_extent->dpa_range, &r))
+					continue;
+				if (seq_matters &&
+				    le16_to_cpu(pos->extent->shared_extn_seq) !=
+				    dc_extent->seq_num)
+					continue;
+				found = true;
+				break;
+			}
+			if (!found)
+				return false;
+			named++;
+		}
+	}
+
+	return named == group->nr_extents;
+}
+
+/**
+ * cxl_release_tag_group() - tear a validated tag group down
+ * @cxlr: region owning the group
+ * @group: the group to release
+ *
+ * Return: 0 when the group is gone, negative when the caller must leave it
+ * intact and let the device retry.
+ */
+int cxl_release_tag_group(struct cxl_region *cxlr,
+			  struct cxl_dc_tag_group *group)
+{
+	int rc;
+
+	/*
+	 * Invalidate CPU caches for the region before releasing the capacity
+	 * back to the device so it cannot reassign the range while stale
+	 * cached data lingers.  On failure do not release: leave the tag
+	 * group intact and let the device retry.
+	 */
+	rc = cxl_region_invalidate_memregion(cxlr);
+	if (rc)
+		return rc;
+
+	rm_tag_group(group);
+	return 0;
+}
+
 static void cleanup_pending_dc_extent(struct dc_extent *dc_extent)
 {
 	struct cxl_dc_tag_group *group = dc_extent->group;
