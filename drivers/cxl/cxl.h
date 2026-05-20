@@ -325,6 +325,37 @@ enum cxl_decoder_state {
 	CXL_DECODER_STATE_AUTO_STAGED,
 };
 
+struct cxl_dc_tag_group;
+
+/**
+ * struct dc_extent - A single dynamic-capacity extent surfaced to the host.
+ *
+ * One per device-stamped extent.  Multiple dc_extents that share a tag
+ * (see &struct cxl_dc_tag_group) form a single logical allocation, but
+ * each dc_extent has its own HPA range.
+ *
+ * @dev: device representing this extent; child of its tag_groupX.Y
+ *	device, or of the dax_region itself for a null tag.
+ * @group: tag group that this extent belongs to; shared across siblings.
+ * @dpa_range: DPA range this extent covers within the region's decoder.
+ * @hpa_range: HPA range that @dpa_range decodes to, relative to
+ *	       cxlr_dax->hpa_range.start.
+ * @uuid: tag uuid (matches @group->uuid).
+ * @seq_num: 0..n-1 assembly-order index within the tag group.  For a
+ *	     sharable partition the order follows the shared_extn_seq given
+ *	     by the device; for a non-sharable partition, where
+ *	     shared_extn_seq is reserved, the order is the order in which
+ *	     extents arrive.  Either way @seq_num forms a dense range 0..n-1.
+ */
+struct dc_extent {
+	struct device dev;
+	struct cxl_dc_tag_group *group;
+	struct range dpa_range;
+	struct range hpa_range;
+	uuid_t uuid;
+	u16 seq_num;
+};
+
 /**
  * struct cxl_endpoint_decoder - Endpoint  / SPA to DPA decoder
  * @cxld: base cxl_decoder_object
@@ -490,6 +521,7 @@ struct cxl_region_params {
  * @type: Endpoint decoder target type
  * @cxl_nvb: nvdimm bridge for coordinating @cxlr_pmem setup / shutdown
  * @cxlr_pmem: (for pmem regions) cached copy of the nvdimm bridge
+ * @cxlr_dax: the region's cxl_dax_region while it is registered, else NULL
  * @flags: Region state flags
  * @shareable: (for DC regions) backing partitions must be shareable
  * @read_only: (for DC regions) backing partitions must be read-only
@@ -508,6 +540,7 @@ struct cxl_region {
 	enum cxl_decoder_type type;
 	struct cxl_nvdimm_bridge *cxl_nvb;
 	struct cxl_pmem_region *cxlr_pmem;
+	struct cxl_dax_region *cxlr_dax;
 	unsigned long flags;
 	bool shareable;
 	bool read_only;
@@ -570,7 +603,56 @@ struct cxl_dax_region {
 	struct device dev;
 	struct cxl_region *cxlr;
 	struct range hpa_range;
+	/* ids for the extentX.Y and tag_groupX.Y devices under this region */
+	struct ida extent_ida;
+	struct ida tag_group_ida;
+	/* The region's single endpoint decoder: DC regions are not interleaved */
+	struct cxl_endpoint_decoder *cxled;
 };
+
+/**
+ * struct cxl_dc_tag_group - A tagged dynamic-capacity allocation.
+ *
+ * Container for the &struct dc_extent siblings that share a tag.  A
+ * tagged group is a tag_groupX.Y device under the dax_region and the
+ * parent of its extentX.Y devices; untagged extents, each a group of
+ * one, sit directly under the dax_region instead.  The group
+ * exists to keep tag-scoped invariants (atomic add, atomic release,
+ * ordered carve by seq_num) in one place.
+ *
+ * @dev: device representing a tagged group; child of cxlr_dax->dev.
+ *	Holds the group's memory; the teardown that removes the group
+ *	drops the final reference.  Never registered for an untagged
+ *	group, whose extent is a direct child of the dax_region.
+ * @cxlr_dax: back reference to parent region device.
+ * @uuid: tag identifying this allocation; same across all member dc_extents.
+ * @dc_extents: xarray of &struct dc_extent in this group, indexed by the
+ *		dc_extent's @seq_num (0..n-1, dense).  See &struct dc_extent
+ *		for how seq_num is sourced for sharable vs non-sharable
+ *		allocations.
+ * @nr_extents: number of member dc_extents
+ * @pending_online: built, awaiting the Add response; on the memdev's
+ *		    dc_chain.tag_groups list
+ * @node: anchor on the host-wide list of online groups, from
+ *	  online_tag_group() to rm_tag_group()
+ */
+struct cxl_dc_tag_group {
+	struct device dev;
+	struct cxl_dax_region *cxlr_dax;
+	uuid_t uuid;
+	struct xarray dc_extents;
+	unsigned int nr_extents;
+	struct list_head pending_online;
+	struct list_head node;
+};
+
+bool is_dc_extent(struct device *dev);
+static inline struct dc_extent *to_dc_extent(struct device *dev)
+{
+	if (!is_dc_extent(dev))
+		return NULL;
+	return container_of(dev, struct dc_extent, dev);
+}
 
 /**
  * struct cxl_port - logical collection of upstream port devices and

@@ -13,6 +13,10 @@ static void cxl_dax_region_release(struct device *dev)
 {
 	struct cxl_dax_region *cxlr_dax = to_cxl_dax_region(dev);
 
+	if (cxlr_dax->cxled)
+		put_device(&cxlr_dax->cxled->cxld.dev);
+	ida_destroy(&cxlr_dax->extent_ida);
+	ida_destroy(&cxlr_dax->tag_group_ida);
 	kfree(cxlr_dax);
 }
 
@@ -49,7 +53,8 @@ static struct cxl_dax_region *cxl_dax_region_alloc(struct cxl_region *cxlr)
 	struct cxl_dax_region *cxlr_dax;
 	struct device *dev;
 
-	guard(rwsem_read)(&cxl_rwsem.region);
+	/* Publishes cxlr->cxlr_dax, which the event paths read under the read lock */
+	guard(rwsem_write)(&cxl_rwsem.region);
 	if (p->state != CXL_CONFIG_COMMIT)
 		return ERR_PTR(-ENXIO);
 
@@ -57,11 +62,23 @@ static struct cxl_dax_region *cxl_dax_region_alloc(struct cxl_region *cxlr)
 	if (!cxlr_dax)
 		return ERR_PTR(-ENOMEM);
 
+	ida_init(&cxlr_dax->extent_ida);
+	ida_init(&cxlr_dax->tag_group_ida);
 	cxlr_dax->hpa_range.start = p->res->start;
 	cxlr_dax->hpa_range.end = p->res->end;
 
+	/*
+	 * DC regions are not interleaved.  The decoder may detach from the
+	 * region while its groups are still held, so hold a reference.
+	 */
+	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM)
+		cxlr_dax->cxled = p->targets[0];
+	if (cxlr_dax->cxled)
+		get_device(&cxlr_dax->cxled->cxld.dev);
+
 	dev = &cxlr_dax->dev;
 	cxlr_dax->cxlr = cxlr;
+	cxlr->cxlr_dax = cxlr_dax;
 	device_initialize(dev);
 	lockdep_set_class(&dev->mutex, &cxl_dax_region_key);
 	device_set_pm_not_required(dev);
@@ -72,12 +89,35 @@ static struct cxl_dax_region *cxl_dax_region_alloc(struct cxl_region *cxlr)
 	return cxlr_dax;
 }
 
+/*
+ * Clearing cxlr->cxlr_dax here cannot race an Add event.  The add path
+ * finds cxlr_dax through cxl_dpa_to_region() and uses it with
+ * cxl_rwsem.region held for read, from resolving an extent through
+ * onlining its group.  Taking the write lock waits those paths out, and
+ * later lookups find NULL, so the teardown that follows sees no adds.
+ */
+static void cxlr_dax_unpublish(struct cxl_dax_region *cxlr_dax)
+{
+	guard(rwsem_write)(&cxl_rwsem.region);
+	cxlr_dax->cxlr->cxlr_dax = NULL;
+}
+
 static void cxlr_dax_unregister(void *_cxlr_dax)
 {
 	struct cxl_dax_region *cxlr_dax = _cxlr_dax;
 
+	cxlr_dax_unpublish(cxlr_dax);
+	/* Unbind first: the DAX devices over the groups go with the driver */
+	device_release_driver(&cxlr_dax->dev);
+	cxl_dax_region_release_groups(cxlr_dax);
 	device_unregister(&cxlr_dax->dev);
 }
+
+DEFINE_FREE(unpublish_cxl_dax_region, struct cxl_dax_region *,
+	if (!IS_ERR_OR_NULL(_T)) {
+		cxlr_dax_unpublish(_T);
+		put_device(&_T->dev);
+	})
 
 int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 {
@@ -90,7 +130,7 @@ int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 		return -EINVAL;
 	}
 
-	struct cxl_dax_region *cxlr_dax __free(put_cxl_dax_region) =
+	struct cxl_dax_region *cxlr_dax __free(unpublish_cxl_dax_region) =
 		cxl_dax_region_alloc(cxlr);
 	if (IS_ERR(cxlr_dax))
 		return PTR_ERR(cxlr_dax);
