@@ -282,6 +282,14 @@ static int __dax_region_rm_resource(struct dax_region *dax_region,
 	return 0;
 }
 
+int dax_region_rm_resource(struct dax_region *dax_region,
+			   struct device *dev)
+{
+	guard(rwsem_write)(&dax_region_rwsem);
+	return __dax_region_rm_resource(dax_region, dev);
+}
+EXPORT_SYMBOL_GPL(dax_region_rm_resource);
+
 /**
  * dax_region_add_resources - atomically add a set of dax_resources.
  *
@@ -313,6 +321,41 @@ int dax_region_add_resources(struct dax_region *dax_region,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dax_region_add_resources);
+
+/**
+ * dax_region_rm_resources - atomically remove a set of dax_resources.
+ *
+ * Walk @devs twice under dax_region_rwsem.  First pass refuses the
+ * operation if any member's use_cnt is non-zero; second pass releases
+ * each.  This gives refuse-all-or-none semantics across the set, which
+ * a tag group's atomic release relies on.  Devices with no
+ * dax_resource attached are silently skipped.
+ */
+int dax_region_rm_resources(struct dax_region *dax_region,
+			    struct device * const *devs, unsigned int n)
+{
+	unsigned int i;
+
+	guard(rwsem_write)(&dax_region_rwsem);
+
+	for (i = 0; i < n; i++) {
+		struct dax_resource *r = dev_get_drvdata(devs[i]);
+
+		if (r && r->use_cnt)
+			return -EBUSY;
+	}
+
+	for (i = 0; i < n; i++) {
+		struct dax_resource *r = dev_get_drvdata(devs[i]);
+
+		if (!r)
+			continue;
+		__dax_release_resource(r);
+		dev_set_drvdata(devs[i], NULL);
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dax_region_rm_resources);
 
 bool static_dev_dax(struct dev_dax *dev_dax)
 {

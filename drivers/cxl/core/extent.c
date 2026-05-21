@@ -556,6 +556,17 @@ int cxl_release_tag_group(struct cxl_dc_tag_group *group)
 	if (rc)
 		return rc;
 
+	rc = cxlr_notify_extent(group, DCD_RELEASE_CAPACITY);
+	if (rc) {
+		/*
+		 * dax layer refused (-EBUSY) or failed (-ENOMEM, etc.).  Do
+		 * not proceed to tear down the tag group — leave its
+		 * dax_resources alive so we do not free them out from under
+		 * live dev_dax ranges.  The device will retry the release.
+		 */
+		return rc;
+	}
+
 	rm_tag_group(group);
 	return 0;
 }
