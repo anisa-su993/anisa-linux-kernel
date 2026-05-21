@@ -1527,6 +1527,24 @@ static int cxl_realize_group(struct cxl_memdev_state *mds, const uuid_t *tag,
 		return rc;
 	}
 
+	rc = cxlr_notify_extent(tag_group->cxlr_dax->cxlr, DCD_ADD_CAPACITY,
+				tag_group);
+	if (rc) {
+		/*
+		 * The dax-side notification failed; tear down the tag group.
+		 * For a fresh add (!existing) the extents were never accepted —
+		 * they are omitted from the trailing Add-DC-Response — so
+		 * suppress the per-extent Release DC; the device never handed us
+		 * this capacity to release.  Recovered (existing) extents are
+		 * already accepted and cannot be re-notified, so release them
+		 * back to the device rather than leak the capacity.
+		 */
+		if (!existing)
+			tag_group->skip_device_release = true;
+		rm_tag_group(tag_group);
+		return rc;
+	}
+
 	return group_cnt;
 }
 
