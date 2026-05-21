@@ -1585,8 +1585,29 @@ static int cxl_add_pending(struct cxl_memdev_state *mds, bool existing)
 			list_for_each_entry_safe(pos, tmp, &group, list)
 				delete_extent_node(pos);
 		} else {
-			list_splice_tail_init(&group, &accepted);
-			total_accepted += group_cnt;
+			rc = cxlr_notify_extent(tag_group->cxlr_dax->cxlr,
+						DCD_ADD_CAPACITY, tag_group);
+			if (rc) {
+				/*
+				 * The dax-side notification failed; tear down the
+				 * tag group and drop the extents.  For a fresh add
+				 * (!existing) the extents were never accepted — they
+				 * are omitted from the trailing Add-DC-Response — so
+				 * suppress the per-extent Release DC; the device never
+				 * handed us this capacity to release.  Recovered
+				 * (existing) extents are already accepted and cannot
+				 * be re-notified, so release them back to the device
+				 * rather than leak the capacity.
+				 */
+				if (!existing)
+					tag_group->skip_device_release = true;
+				rm_tag_group(tag_group);
+				list_for_each_entry_safe(pos, tmp, &group, list)
+					delete_extent_node(pos);
+			} else {
+				list_splice_tail_init(&group, &accepted);
+				total_accepted += group_cnt;
+			}
 		}
 
 		mds->add_ctx.group = NULL;
