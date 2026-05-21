@@ -1540,6 +1540,14 @@ static int cxl_realize_group(struct cxl_memdev_state *mds, const uuid_t *tag,
 		return rc;
 	}
 
+	rc = cxlr_notify_extent(tag_group->cxlr_dax->cxlr, DCD_ADD_CAPACITY,
+				tag_group);
+	if (rc) {
+		/* Notify failed; teardown honors skip_device_release set above. */
+		rm_tag_group(tag_group);
+		return rc;
+	}
+
 	/* Accepted; a later teardown must send Release DC. */
 	tag_group->skip_device_release = false;
 
