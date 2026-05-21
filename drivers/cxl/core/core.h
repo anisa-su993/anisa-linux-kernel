@@ -89,6 +89,7 @@ const struct cxl_dpa_partition *
 cxl_extent_dc_partition(struct cxl_memdev_state *mds,
 			struct cxl_extent *extent,
 			struct range *ext_range);
+int cxlr_notify_extent(struct cxl_dc_tag_group *group, enum dc_event event);
 #else
 static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 				 const struct cxl_memdev *cxlmd, u64 dpa)
@@ -122,6 +123,12 @@ static inline int online_tag_group(struct cxl_dc_tag_group *group)
 }
 
 static inline void rm_tag_group(struct cxl_dc_tag_group *group) { }
+
+static inline int cxlr_notify_extent(struct cxl_dc_tag_group *group,
+				     enum dc_event event)
+{
+	return 0;
+}
 
 static inline
 struct cxl_region *cxl_dpa_to_region(const struct cxl_memdev *cxlmd, u64 dpa,

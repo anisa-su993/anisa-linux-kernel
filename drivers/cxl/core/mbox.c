@@ -1690,8 +1690,9 @@ static int cxl_validate_group(struct cxl_memdev_state *mds, const uuid_t *tag,
 }
 
 /*
- * Online an accepted @group.  The device already counts its extents as the
- * host's, so a group that fails to online goes back with a Release DC.
+ * Online an accepted @group and hand it to the dax region.  The device
+ * already counts its extents as the host's, so a group that fails to online
+ * or that the dax region refuses goes back with a Release DC.
  */
 static void cxl_online_group(struct cxl_memdev_state *mds,
 			     struct cxl_dc_tag_group *group)
@@ -1709,10 +1710,23 @@ static void cxl_online_group(struct cxl_memdev_state *mds,
 	if (rc) {
 		dev_warn(dev, "Tag %pUb: failed to online tag group (%d)\n",
 			 &tag, rc);
-		if (cnt < 0 ||
-		    cxl_send_dc_response(mds, CXL_MBOX_OP_RELEASE_DC, &acks, cnt))
-			dev_dbg(dev, "Tag %pUb: failed to release\n", &tag);
+		goto release;
 	}
+
+	rc = cxlr_notify_extent(group, DCD_ADD_CAPACITY);
+	if (rc) {
+		dev_warn(dev, "Tag %pUb: dax region refused tag group (%d)\n",
+			 &tag, rc);
+		rm_tag_group(group);
+		goto release;
+	}
+	goto out;
+
+release:
+	if (cnt < 0 ||
+	    cxl_send_dc_response(mds, CXL_MBOX_OP_RELEASE_DC, &acks, cnt))
+		dev_dbg(dev, "Tag %pUb: failed to release\n", &tag);
+out:
 	drop_extent_group(&acks);
 }
 
