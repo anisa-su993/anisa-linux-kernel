@@ -200,6 +200,20 @@ void cxl_region_reset_extent_scan(struct cxl_dax_region *cxlr_dax)
 }
 EXPORT_SYMBOL_NS_GPL(cxl_region_reset_extent_scan, "CXL");
 
+/*
+ * Publish or clear the dax driver's DC event hook.  The event paths call
+ * the hook under cxl_rwsem.region for read, so once this returns a cleared
+ * hook is no longer running anywhere.
+ */
+void cxl_dax_region_set_notify(struct cxl_dax_region *cxlr_dax,
+			       int (*notify)(struct device *dev,
+					     struct cxl_notify_data *notify_data))
+{
+	guard(rwsem_write)(&cxl_rwsem.region);
+	cxlr_dax->notify = notify;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_dax_region_set_notify, "CXL");
+
 int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 {
 	struct device *dev;

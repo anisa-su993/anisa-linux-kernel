@@ -94,6 +94,8 @@ const struct cxl_dpa_partition *
 cxl_extent_dc_partition(struct cxl_memdev_state *mds,
 			struct cxl_extent *extent,
 			struct range *ext_range);
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+		       struct cxl_dc_tag_group *group);
 #else
 static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 				 const struct cxl_memdev *cxlmd, u64 dpa)
@@ -144,6 +146,13 @@ static inline int cxl_dax_untagged_add(struct cxl_dax_region *cxlr_dax)
 static inline bool cxl_tag_already_committed(const uuid_t *tag)
 {
 	return false;
+}
+
+static inline int cxlr_notify_extent(struct cxl_region *cxlr,
+				     enum dc_event event,
+				     struct cxl_dc_tag_group *group)
+{
+	return 0;
 }
 
 static inline

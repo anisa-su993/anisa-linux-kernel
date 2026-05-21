@@ -604,6 +604,8 @@ enum dc_event {
 	DCD_REGION_CONFIGURATION_UPDATED,
 };
 
+struct cxl_notify_data;
+
 struct cxl_dax_region {
 	struct device dev;
 	struct cxl_region *cxlr;
@@ -623,6 +625,8 @@ struct cxl_dax_region {
 	struct cxl_endpoint_decoder *cxled;
 	/* Set once the probe has read the device's pre-existing extents. */
 	bool extents_scanned;
+	/* dax driver's DC event hook; set and cleared under cxl_rwsem.region */
+	int (*notify)(struct device *dev, struct cxl_notify_data *notify_data);
 };
 
 /**
@@ -955,6 +959,11 @@ bool is_cxl_region(struct device *dev);
 
 extern const struct bus_type cxl_bus_type;
 
+struct cxl_notify_data {
+	enum dc_event event;
+	struct cxl_dc_tag_group *group;
+};
+
 /*
  * Note, add_dport() is expressly for the cxl_port driver. TODO: investigate a
  * type-safe driver model where probe()/remove() take the type of object implied
@@ -1012,6 +1021,9 @@ int cxl_add_to_region(struct cxl_endpoint_decoder *cxled);
 struct cxl_dax_region *to_cxl_dax_region(struct device *dev);
 int cxl_region_add_existing_extents(struct cxl_dax_region *cxlr_dax);
 void cxl_region_reset_extent_scan(struct cxl_dax_region *cxlr_dax);
+void cxl_dax_region_set_notify(struct cxl_dax_region *cxlr_dax,
+			       int (*notify)(struct device *dev,
+					     struct cxl_notify_data *notify_data));
 bool cxl_region_contains_resource(const struct resource *res);
 #else
 static inline bool is_cxl_pmem_region(struct device *dev)
@@ -1039,6 +1051,13 @@ cxl_region_add_existing_extents(struct cxl_dax_region *cxlr_dax)
 
 static inline void
 cxl_region_reset_extent_scan(struct cxl_dax_region *cxlr_dax)
+{
+}
+
+static inline void
+cxl_dax_region_set_notify(struct cxl_dax_region *cxlr_dax,
+			  int (*notify)(struct device *dev,
+					struct cxl_notify_data *notify_data))
 {
 }
 

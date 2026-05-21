@@ -361,6 +361,30 @@ dc_extent_build(struct cxl_endpoint_decoder *cxled,
 }
 
 /*
+ * Hand a tag group to the dax driver.  Runs under cxl_rwsem.region for
+ * read, which pins the hook: cxl_dax_region_set_notify() changes it under
+ * the write lock.  No hook means no driver, and nothing to coordinate.
+ */
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+		       struct cxl_dc_tag_group *group)
+{
+	struct cxl_dax_region *cxlr_dax = cxlr->cxlr_dax;
+	struct cxl_notify_data notify_data = {
+		.event = event,
+		.group = group,
+	};
+
+	lockdep_assert_held(&cxl_rwsem.region);
+
+	if (!cxlr_dax->notify)
+		return 0;
+
+	dev_dbg(&cxlr_dax->dev, "Notify: type %d tag %pUb\n", event,
+		&group->uuid);
+	return cxlr_dax->notify(&cxlr_dax->dev, &notify_data);
+}
+
+/*
  * Stage 4: insert @dc_extent into the pending tag group.  All extents in
  * one More-chain group share a UUID — enforced here as the group is
  * either being created (first extent) or appended to.  On any failure
