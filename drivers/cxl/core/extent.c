@@ -309,6 +309,47 @@ dc_extent_build(struct cxl_endpoint_decoder *cxled,
 }
 
 /*
+ * Lock-held notify for the existing-extent scan, which runs inside
+ * cxl_dax_region_probe() with the dax_region's device_lock already held.
+ */
+int __cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+			 struct cxl_dc_tag_group *group)
+{
+	struct device *dev = &cxlr->cxlr_dax->dev;
+	struct cxl_notify_data notify_data;
+	struct cxl_driver *driver;
+
+	device_lock_assert(dev);
+
+	dev_dbg(dev, "Trying notify: type %d tag %pUb\n", event, &group->uuid);
+
+	/*
+	 * The lack of a driver indicates a notification has failed.  No user
+	 * space coordination was possible.
+	 */
+	if (!dev->driver)
+		return 0;
+	driver = to_cxl_drv(dev->driver);
+	if (!driver->notify)
+		return 0;
+
+	notify_data = (struct cxl_notify_data) {
+		.event = event,
+		.group = group,
+	};
+
+	dev_dbg(dev, "Notify: type %d tag %pUb\n", event, &group->uuid);
+	return driver->notify(dev, &notify_data);
+}
+
+int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
+		       struct cxl_dc_tag_group *group)
+{
+	guard(device)(&cxlr->cxlr_dax->dev);
+	return __cxlr_notify_extent(cxlr, event, group);
+}
+
+/*
  * Stage 4: insert @dc_extent into the pending tag group.  All extents in
  * one More-chain group share a UUID — enforced here as the group is
  * either being created (first extent) or appended to.  On any failure
