@@ -1633,6 +1633,13 @@ static int cxl_realize_group(struct cxl_memdev_state *mds, const uuid_t *tag,
 		goto err_release;
 	}
 
+	rc = cxlr_notify_extent(tag_group->cxlr_dax->cxlr, DCD_ADD_CAPACITY,
+				tag_group);
+	if (rc) {
+		rm_tag_group(tag_group);
+		goto err_release;
+	}
+
 	return group_cnt;
 
 err_discard:

@@ -5,11 +5,82 @@
 
 #include "../cxl/cxl.h"
 #include "bus.h"
+#include "dax-private.h"
+
+static int cxl_dax_group_add(struct dax_region *dax_region,
+			     struct cxl_dc_tag_group *group)
+{
+	struct dax_resource_spec *specs;
+	struct dc_extent *dc_extent;
+	unsigned long index;
+	unsigned int n = 0;
+	int rc;
+
+	if (!group->nr_extents)
+		return 0;
+
+	specs = kmalloc_array(group->nr_extents, sizeof(*specs), GFP_KERNEL);
+	if (!specs)
+		return -ENOMEM;
+
+	xa_for_each(&group->dc_extents, index, dc_extent) {
+		if (n == group->nr_extents)
+			break;
+		specs[n++] = (struct dax_resource_spec) {
+			.device = &dc_extent->dev,
+			.start = dax_region->res.start + dc_extent->hpa_range.start,
+			.length = range_len(&dc_extent->hpa_range),
+			.seq_num = dc_extent->seq_num,
+		};
+	}
+
+	/* Atomic all-or-none add, mirroring cxl_dax_group_rm(). */
+	rc = dax_region_add_resources(dax_region, specs, n, &group->uuid);
+	kfree(specs);
+	return rc;
+}
+
+/*
+ * RELEASE is still a stub here — the atomic dax_region_rm_resources API
+ * and its wire-up land in the next commit.  An incoming RELEASE returns
+ * success and the cxl side proceeds to rm_tag_group(), which device-
+ * unregisters each dc_extent; the devm action armed by
+ * dax_region_add_resource() then tears down each dax_resource.
+ */
+static int cxl_dax_region_notify(struct device *dev,
+				 struct cxl_notify_data *notify_data)
+{
+	struct cxl_dax_region *cxlr_dax = to_cxl_dax_region(dev);
+	struct dax_region *dax_region = dev_get_drvdata(dev);
+	struct cxl_dc_tag_group *group = notify_data->group;
+
+	switch (notify_data->event) {
+	case DCD_ADD_CAPACITY:
+		return cxl_dax_group_add(dax_region, group);
+	case DCD_RELEASE_CAPACITY:
+		dev_dbg(&cxlr_dax->dev,
+			"DCD RELEASE notify (tag %pUb): no-op (stub)\n",
+			&group->uuid);
+		return 0;
+	case DCD_FORCED_CAPACITY_RELEASE:
+	default:
+		dev_err(&cxlr_dax->dev, "Unknown DC event %d\n",
+			notify_data->event);
+		return -ENXIO;
+	}
+}
+
+static struct dax_dc_ops dc_ops = {
+	.is_extent = is_dc_extent,
+};
 
 static void cxl_dax_region_remove(struct device *dev)
 {
-	/* Refuse new adds; devres returns the held extents */
-	cxl_region_reset_extent_scan(to_cxl_dax_region(dev));
+	struct cxl_dax_region *cxlr_dax = to_cxl_dax_region(dev);
+
+	/* Refuse new adds, then stop events; devres returns the held extents */
+	cxl_region_reset_extent_scan(cxlr_dax);
+	cxl_dax_region_set_notify(cxlr_dax, NULL);
 }
 
 static int cxl_dax_region_probe(struct device *dev)
@@ -32,12 +103,13 @@ static int cxl_dax_region_probe(struct device *dev)
 		flags = IORESOURCE_DAX_KMEM;
 
 	dax_region = alloc_dax_region(dev, cxlr->id, &cxlr_dax->hpa_range, nid,
-				      PMD_SIZE, flags);
+				      PMD_SIZE, flags, &dc_ops);
 	if (!dax_region)
 		return -ENOMEM;
 
 	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM) {
-		/* Recover extents the device still holds for this region */
+		/* Take DC events from here on, the recovered extents first */
+		cxl_dax_region_set_notify(cxlr_dax, cxl_dax_region_notify);
 		rc = cxl_region_add_existing_extents(cxlr_dax);
 		if (rc)
 			goto err_remove;
