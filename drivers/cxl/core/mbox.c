@@ -1203,14 +1203,77 @@ static void clear_pending_extents(void *_mds)
 
 	list_for_each_entry_safe(pos, tmp, &mds->add_ctx.pending_extents, list)
 		delete_extent_node(pos);
+	mds->add_ctx.nr_pending = 0;
 	mds->add_ctx.group = NULL;
+}
+
+/*
+ * Defensive cap on extents staged in one runtime More=1 chain: a buggy
+ * device could otherwise grow the list without bound.  Not spec-defined.
+ */
+#define CXL_DC_MAX_PENDING_EXTENTS	100
+
+/*
+ * Bound on how long the host will wait for a device to finish a
+ * multi-record DC_ADD_CAPACITY chain (More=1 ... More=0) before
+ * refusing the chain.
+ * The timeout is not defined in the spec, but added for defensive purposes.
+ * Since there is no spec-defined timeout, 20s is chosen as a generous
+ * upper bound and matches the GPF timeout.
+ */
+#define CXL_DC_ADD_TIMEOUT	(20 * HZ)
+
+static void cxl_dc_add_timeout(struct work_struct *work)
+{
+	struct pending_add_ctx *ctx = container_of(to_delayed_work(work),
+						   struct pending_add_ctx,
+						   timeout_work);
+	struct cxl_memdev_state *mds = container_of(ctx,
+						    struct cxl_memdev_state,
+						    add_ctx);
+	struct device *dev = mds->cxlds.dev;
+
+	guard(mutex)(&ctx->lock);
+
+	/*
+	 * handle_add_event() cancels this work non-synchronously (a sync
+	 * cancel would deadlock on @ctx->lock, which the chain-close path
+	 * holds), so a callback that already started running can reach here
+	 * after its chain has moved on.  Abort only if a chain is still armed
+	 * AND the timer has not been re-armed since this expiry fired: a fresh
+	 * mod_delayed_work() (a later extent in this chain, or a new chain)
+	 * makes delayed_work_pending() true, meaning this expiry belongs to a
+	 * superseded deadline and must not abort the current chain.
+	 */
+	if (!ctx->armed || delayed_work_pending(&ctx->timeout_work))
+		return;
+
+	dev_warn(dev, "DC add chain timed out; refusing staged extents\n");
+
+	if (cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
+				 &ctx->pending_extents, 0))
+		dev_dbg(dev, "Failed to send empty ADD_DC_RESPONSE on timeout\n");
+
+	clear_pending_extents(mds);
+	ctx->armed = false;
+}
+
+static void cxl_cancel_dcd_add_chain_work(void *_mds)
+{
+	struct cxl_memdev_state *mds = _mds;
+
+	cancel_delayed_work_sync(&mds->add_ctx.timeout_work);
 }
 
 static int add_to_pending_list(struct list_head *pending_list,
 			       struct cxl_extent *to_add)
 {
+	struct pending_add_ctx *ctx =
+		container_of(pending_list, struct pending_add_ctx, pending_extents);
 	struct cxl_extent_list_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
 	struct cxl_extent *extent;
+
+	lockdep_assert_held(&ctx->lock);
 
 	if (!node)
 		return -ENOMEM;
@@ -1222,25 +1285,61 @@ static int add_to_pending_list(struct list_head *pending_list,
 
 	node->extent = extent;
 	list_add_tail(&node->list, pending_list);
+	ctx->nr_pending++;
 	return 0;
 }
 
 static int handle_add_event(struct cxl_memdev_state *mds,
 			    struct cxl_event_dcd *event)
 {
+	struct pending_add_ctx *ctx = &mds->add_ctx;
 	struct device *dev = mds->cxlds.dev;
 	int rc;
 
-	rc = add_to_pending_list(&mds->add_ctx.pending_extents, &event->extent);
+	guard(mutex)(&ctx->lock);
+
+	if (ctx->nr_pending >= CXL_DC_MAX_PENDING_EXTENTS) {
+		dev_warn(dev, "DC add chain exceeds %u extents; dropping (firmware bug)\n",
+			 CXL_DC_MAX_PENDING_EXTENTS);
+		clear_pending_extents(mds);
+		return -ENOSPC;
+	}
+
+	rc = add_to_pending_list(&ctx->pending_extents, &event->extent);
 	if (rc) {
 		clear_pending_extents(mds);
+
+		/*
+		 * If More chain only has 1 record and errors before watchdog is
+		 * armed, cxl_add_pending will never be reached, so no response
+		 * is sent. Return an empty response. Also sends empty response
+		 * for multi-record chain pre-emptively rather than waiting for
+		 * watchdog to trigger.
+		 */
+		if (!(event->flags & CXL_DCD_EVENT_MORE)) {
+			ctx->armed = false;
+			cancel_delayed_work(&ctx->timeout_work);
+			if (cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
+						 &ctx->pending_extents, 0))
+				dev_dbg(dev, "Failed to refuse chain after staging error\n");
+		}
 		return rc;
 	}
 
 	if (event->flags & CXL_DCD_EVENT_MORE) {
 		dev_dbg(dev, "more bit set; delay the surfacing of extent\n");
+		mod_delayed_work(system_wq, &ctx->timeout_work,
+						 CXL_DC_ADD_TIMEOUT);
+		ctx->armed = true;
 		return 0;
 	}
+
+	/*
+	 * Chain is closing.  Disarm before flushing so a pending watchdog
+	 * (queued but blocked on @ctx->lock) sees !armed and bails out.
+	 */
+	ctx->armed = false;
+	cancel_delayed_work(&ctx->timeout_work);
 
 	rc = cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
 				  &mds->add_ctx.pending_extents, 0);
@@ -2100,8 +2199,20 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev, u64 serial,
 
 	mutex_init(&mds->event.log_lock);
 	INIT_LIST_HEAD(&mds->add_ctx.pending_extents);
+	mutex_init(&mds->add_ctx.lock);
+	INIT_DELAYED_WORK(&mds->add_ctx.timeout_work,
+			  cxl_dc_add_timeout);
 
 	rc = devm_add_action_or_reset(dev, clear_pending_extents, mds);
+	if (rc)
+		return ERR_PTR(rc);
+
+	/*
+	 * Registered after clear_pending_extents so devm's reverse-order
+	 * unwind cancels (and waits for) the watchdog first, then the list
+	 * cleanup runs with the watchdog guaranteed not to refire.
+	 */
+	rc = devm_add_action_or_reset(dev, cxl_cancel_dcd_add_chain_work, mds);
 	if (rc)
 		return ERR_PTR(rc);
 
