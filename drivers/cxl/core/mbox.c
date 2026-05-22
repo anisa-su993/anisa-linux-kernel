@@ -1196,6 +1196,16 @@ static void clear_pending_extents(void *_mds)
 	mds->dc_chain.group = NULL;
 }
 
+/*
+ * Bound on how long the host will wait for a device to finish a
+ * multi-record DC event chain (More=1 ... More=0) before refusing the
+ * chain.
+ * The timeout is not defined in the spec, but added for defensive purposes.
+ * Since there is no spec-defined timeout, 20s is chosen as a generous
+ * upper bound and matches the GPF timeout.
+ */
+#define CXL_DC_CHAIN_TIMEOUT	(20 * HZ)
+
 static const char *cxl_dcd_evt_type_str(u8 type)
 {
 	switch (type) {
@@ -1222,12 +1232,54 @@ static void cxl_dc_chain_abort(struct cxl_memdev_state *mds)
 	struct cxl_dc_event_chain *chain = &mds->dc_chain;
 	struct device *dev = mds->cxlds.dev;
 
+	lockdep_assert_held(&chain->lock);
+
+	chain->armed = false;
+	cancel_delayed_work(&chain->timeout_work);
+
 	if (chain->event_type == DCD_ADD_CAPACITY &&
 	    cxl_send_dc_response(mds, CXL_MBOX_OP_ADD_DC_RESPONSE,
 				 &chain->pending_extents, 0))
 		dev_dbg(dev, "Failed to refuse add chain\n");
 
 	clear_pending_extents(mds);
+}
+
+static void cxl_dc_chain_timeout(struct work_struct *work)
+{
+	struct cxl_dc_event_chain *chain = container_of(to_delayed_work(work),
+							struct cxl_dc_event_chain,
+							timeout_work);
+	struct cxl_memdev_state *mds = container_of(chain,
+						    struct cxl_memdev_state,
+						    dc_chain);
+	struct device *dev = mds->cxlds.dev;
+
+	guard(mutex)(&chain->lock);
+
+	/*
+	 * handle_dcd_chain_event() cancels this work non-synchronously (a sync
+	 * cancel would deadlock on @chain->lock, which the chain-close path
+	 * holds), so a callback that already started running can reach here
+	 * after its chain has moved on.  Abort only if a chain is still armed
+	 * AND the timer has not been re-armed since this expiry fired: a new
+	 * chain's queue_delayed_work() makes delayed_work_pending() true,
+	 * meaning this expiry belongs to a superseded deadline and must not
+	 * abort the current chain.
+	 */
+	if (!chain->armed || delayed_work_pending(&chain->timeout_work))
+		return;
+
+	dev_warn(dev, "DC %s chain timed out\n",
+		 cxl_dcd_evt_type_str(chain->event_type));
+	cxl_dc_chain_abort(mds);
+}
+
+static void cxl_cancel_dcd_chain_work(void *_mds)
+{
+	struct cxl_memdev_state *mds = _mds;
+
+	cancel_delayed_work_sync(&mds->dc_chain.timeout_work);
 }
 
 static int stage_pending_extent(struct list_head *pending,
@@ -1256,6 +1308,8 @@ static int handle_dcd_chain_event(struct cxl_memdev_state *mds,
 	struct device *dev = mds->cxlds.dev;
 	int rc;
 
+	guard(mutex)(&chain->lock);
+
 	/* Chained records share one event type (CXL r4.0 Table 8-229) */
 	if (list_empty(&chain->pending_extents)) {
 		chain->event_type = event->event_type;
@@ -1275,8 +1329,21 @@ static int handle_dcd_chain_event(struct cxl_memdev_state *mds,
 
 	if (event->flags & CXL_DCD_EVENT_MORE) {
 		dev_dbg(dev, "more bit set; delay processing of extent\n");
+		/* The deadline is fixed when the chain opens, not per record */
+		if (!chain->armed) {
+			queue_delayed_work(system_wq, &chain->timeout_work,
+					   CXL_DC_CHAIN_TIMEOUT);
+			chain->armed = true;
+		}
 		return 0;
 	}
+
+	/*
+	 * Chain is closing.  Disarm before flushing so a pending watchdog
+	 * (queued but blocked on @chain->lock) sees !armed and bails out.
+	 */
+	chain->armed = false;
+	cancel_delayed_work(&chain->timeout_work);
 
 	/* Nothing is tracked yet: refuse every add, acknowledge every release */
 	if (event->event_type == DCD_ADD_CAPACITY)
@@ -2013,8 +2080,19 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev, u64 serial,
 
 	mutex_init(&mds->event.log_lock);
 	INIT_LIST_HEAD(&mds->dc_chain.pending_extents);
+	mutex_init(&mds->dc_chain.lock);
+	INIT_DELAYED_WORK(&mds->dc_chain.timeout_work, cxl_dc_chain_timeout);
 
 	rc = devm_add_action_or_reset(dev, clear_pending_extents, mds);
+	if (rc)
+		return ERR_PTR(rc);
+
+	/*
+	 * Registered after clear_pending_extents so devm's reverse-order
+	 * unwind cancels (and waits for) the watchdog first, then the list
+	 * cleanup runs with the watchdog guaranteed not to refire.
+	 */
+	rc = devm_add_action_or_reset(dev, cxl_cancel_dcd_chain_work, mds);
 	if (rc)
 		return ERR_PTR(rc);
 
