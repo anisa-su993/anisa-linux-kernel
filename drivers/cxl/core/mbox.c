@@ -1930,8 +1930,8 @@ int cxl_mem_sanitize(struct cxl_memdev *cxlmd, u16 cmd)
 static int cxl_dc_check(struct device *dev, struct cxl_dc_partition_info *part_array,
 			u8 index, struct cxl_dc_partition *dev_part)
 {
-	size_t blk_size = le64_to_cpu(dev_part->block_size);
-	size_t len = le64_to_cpu(dev_part->length);
+	u64 blk_size = le64_to_cpu(dev_part->block_size);
+	u64 len = le64_to_cpu(dev_part->length);
 	u32 handle = le32_to_cpu(dev_part->dsmad_handle);
 
 	part_array[index].start = le64_to_cpu(dev_part->base);
@@ -1956,28 +1956,28 @@ static int cxl_dc_check(struct device *dev, struct cxl_dc_partition_info *part_a
 		}
 	}
 
-	if (!IS_ALIGNED(part_array[index].start, SZ_256M) ||
-	    !IS_ALIGNED(part_array[index].start, blk_size)) {
-		dev_err(dev, "DC partition %d invalid start %zu blk size %zu\n",
-			index, part_array[index].start, blk_size);
-		return -EINVAL;
-	}
-
 	if (part_array[index].size == 0 || len == 0 ||
 	    part_array[index].size < len || !IS_ALIGNED(len, blk_size)) {
-		dev_err(dev, "DC partition %d invalid length; size %zu len %zu blk size %zu\n",
+		dev_err(dev, "DC partition %d invalid length; size %llu len %llu blk size %llu\n",
 			index, part_array[index].size, len, blk_size);
 		return -EINVAL;
 	}
 
 	if (blk_size == 0 || blk_size % CXL_DCD_BLOCK_LINE_SIZE ||
 	    !is_power_of_2(blk_size)) {
-		dev_err(dev, "DC partition %d invalid block size; %zu\n",
+		dev_err(dev, "DC partition %d invalid block size %llu\n",
 			index, blk_size);
 		return -EINVAL;
 	}
 
-	dev_dbg(dev, "DC partition %d start %zu start %zu size %zu\n",
+	if (!IS_ALIGNED(part_array[index].start, SZ_256M) ||
+	    !IS_ALIGNED(part_array[index].start, blk_size)) {
+		dev_err(dev, "DC partition %d invalid start %llu blk size %llu\n",
+			index, part_array[index].start, blk_size);
+		return -EINVAL;
+	}
+
+	dev_dbg(dev, "DC partition %d start %llu start %llu blk size %llu\n",
 		index, part_array[index].start, part_array[index].size,
 		blk_size);
 
@@ -2001,11 +2001,31 @@ static int cxl_get_dc_config(struct cxl_mailbox *mbox, u8 start_partition,
 		.payload_out = dc_resp,
 		.min_out = 8,
 	};
+	size_t expected_sz;
 	int rc;
 
 	rc = cxl_internal_send_cmd(mbox, &mbox_cmd);
 	if (rc < 0)
 		return rc;
+
+	if (dc_resp->partitions_returned > CXL_MAX_DC_PARTITIONS) {
+		dev_err(mbox->host, "Device returned %u partitions, max %d\n",
+			dc_resp->partitions_returned, CXL_MAX_DC_PARTITIONS);
+		return -EIO;
+	}
+
+	expected_sz = struct_size(dc_resp,
+				  partition,
+				  dc_resp->partitions_returned);
+
+	if (mbox_cmd.size_out != expected_sz) {
+		dev_err(mbox->host,
+			"Payload size %zu does not match expected %zu for %u partitions\n",
+			mbox_cmd.size_out,
+			expected_sz,
+			dc_resp->partitions_returned);
+		return -EIO;
+	}
 
 	dev_dbg(mbox->host, "Read %d/%d DC partitions\n",
 		dc_resp->partitions_returned, dc_resp->avail_partition_count);
@@ -2028,14 +2048,15 @@ int cxl_dev_dc_identify(struct cxl_mailbox *mbox,
 			struct cxl_dc_partition_info *dc_info)
 {
 	struct cxl_dc_partition_info partitions[CXL_MAX_DC_PARTITIONS];
+	struct cxl_mbox_get_dc_config_out *dc_resp __free(kfree);
 	struct device *dev = mbox->host;
-	size_t dc_resp_size =
-		sizeof(struct cxl_mbox_get_dc_config_out) + sizeof(partitions);
 	u8 start_partition;
 	u8 num_partitions;
+	size_t dc_resp_size = struct_size(dc_resp,
+					  partition,
+					  CXL_MAX_DC_PARTITIONS);
 
-	struct cxl_mbox_get_dc_config_out *dc_resp __free(kfree) =
-					kmalloc(dc_resp_size, GFP_KERNEL);
+	dc_resp = kmalloc(dc_resp_size, GFP_KERNEL);
 	if (!dc_resp)
 		return -ENOMEM;
 
@@ -2052,6 +2073,13 @@ int cxl_dev_dc_identify(struct cxl_mailbox *mbox,
 		if (rc < 0) {
 			dev_err(dev, "Failed to get DC config: %d\n", rc);
 			return rc;
+		}
+
+		if (rc == 0) {
+			dev_err(dev,
+				"Device reported %u partitions available but returned none at index %u\n",
+				dc_resp->avail_partition_count, start_partition);
+			return -EIO;
 		}
 
 		num_partitions += rc;
@@ -2077,7 +2105,7 @@ int cxl_dev_dc_identify(struct cxl_mailbox *mbox,
 	dc_info->start = partitions[0].start;
 	dc_info->size = partitions[0].size;
 	dc_info->handle = partitions[0].handle;
-	dev_dbg(dev, "Returning partition 0 %zu size %zu\n",
+	dev_dbg(dev, "Returning partition 0 %llu size %llu\n",
 		dc_info->start, dc_info->size);
 
 	return 0;
@@ -2274,7 +2302,6 @@ void cxl_configure_dcd(struct cxl_memdev_state *mds, struct cxl_dpa_info *info)
 {
 	struct cxl_dc_partition_info dc_info = { 0 };
 	struct device *dev = mds->cxlds.dev;
-	size_t skip;
 	int rc;
 
 	rc = cxl_dev_dc_identify(&mds->cxlds.cxl_mbox, &dc_info);
@@ -2286,17 +2313,15 @@ void cxl_configure_dcd(struct cxl_memdev_state *mds, struct cxl_dpa_info *info)
 	}
 
 	/* Skips between pmem and the dynamic partition are not supported */
-	skip = dc_info.start - info->size;
-	if (skip) {
+	if (dc_info.start != info->size) {
 		dev_warn(dev,
-			 "Dynamic Capacity skip from pmem not supported: %zu\n",
-			 skip);
+			 "Dynamic Capacity skip from pmem not supported\n");
 		cxl_disable_dcd(mds);
 		return;
 	}
 
 	info->size += dc_info.size;
-	dev_dbg(dev, "Adding dynamic ram partition A; %zu size %zu\n",
+	dev_dbg(dev, "Adding dynamic ram partition A; %llu size %llu\n",
 		dc_info.start, dc_info.size);
 	add_part(info, dc_info.start, dc_info.size, CXL_PARTMODE_DYNAMIC_RAM_A);
 }
