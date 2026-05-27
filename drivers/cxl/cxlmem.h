@@ -236,7 +236,12 @@ struct cxl_event_state {
 	struct mutex log_lock;
 };
 
-/* Device enabled DCD commands */
+/**
+ * CXL r4.0 Section 8.2.10.9 - Memory Device Command Sets. See Table 8-308.
+ *
+ * The 48h Command Set (Opcodes 4800h - 4803h) defines the device-enabled DCD
+ * commands.
+ * */
 enum dcd_cmd_enabled_bits {
 	CXL_DCD_ENABLED_GET_CONFIG,
 	CXL_DCD_ENABLED_GET_EXTENT_LIST,

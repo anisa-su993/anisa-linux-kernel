@@ -175,8 +175,7 @@ static bool cxl_is_dcd_command(u16 opcode)
 	return (opcode >> 8) == CXL_MBOX_OP_DCD_CMDS;
 }
 
-static void cxl_set_dcd_cmd_enabled(struct cxl_memdev_state *mds, u16 opcode,
-				    unsigned long *cmd_mask)
+static void cxl_set_dcd_cmd_enabled(u16 opcode, unsigned long *cmd_mask)
 {
 	switch (opcode) {
 	case CXL_MBOX_OP_GET_DC_CONFIG:
@@ -196,12 +195,9 @@ static void cxl_set_dcd_cmd_enabled(struct cxl_memdev_state *mds, u16 opcode,
 	}
 }
 
-static bool cxl_verify_dcd_cmds(struct cxl_memdev_state *mds, unsigned long *cmds_seen)
+static bool cxl_verify_dcd_cmds(unsigned long *cmds_seen)
 {
-	DECLARE_BITMAP(all_cmds, CXL_DCD_ENABLED_MAX);
-
-	bitmap_fill(all_cmds, CXL_DCD_ENABLED_MAX);
-	return bitmap_equal(cmds_seen, all_cmds, CXL_DCD_ENABLED_MAX);
+	return bitmap_full(cmds_seen, CXL_DCD_ENABLED_MAX);
 }
 
 static bool cxl_is_poison_command(u16 opcode)
@@ -796,7 +792,7 @@ static void cxl_walk_cel(struct cxl_memdev_state *mds, size_t size, u8 *cel)
 	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
 	struct cxl_cel_entry *cel_entry;
 	const int cel_entries = size / sizeof(*cel_entry);
-	DECLARE_BITMAP(dcd_cmds, CXL_DCD_ENABLED_MAX);
+	DECLARE_BITMAP(dcd_cmds, CXL_DCD_ENABLED_MAX) = {};
 	struct device *dev = mds->cxlds.dev;
 	int i, ro_cmds = 0, wr_cmds = 0;
 
@@ -826,7 +822,7 @@ static void cxl_walk_cel(struct cxl_memdev_state *mds, size_t size, u8 *cel)
 		}
 
 		if (cxl_is_dcd_command(opcode)) {
-			cxl_set_dcd_cmd_enabled(mds, opcode, dcd_cmds);
+			cxl_set_dcd_cmd_enabled(opcode, dcd_cmds);
 			enabled++;
 		}
 
@@ -835,7 +831,7 @@ static void cxl_walk_cel(struct cxl_memdev_state *mds, size_t size, u8 *cel)
 	}
 
 	set_features_cap(cxl_mbox, ro_cmds, wr_cmds);
-	mds->dcd_supported = cxl_verify_dcd_cmds(mds, dcd_cmds);
+	mds->dcd_supported = cxl_verify_dcd_cmds(dcd_cmds);
 }
 
 static struct cxl_mbox_get_supported_logs *cxl_get_gsl(struct cxl_memdev_state *mds)
