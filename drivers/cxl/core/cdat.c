@@ -279,11 +279,12 @@ static void cxl_memdev_set_qos_class(struct cxl_dev_state *cxlds,
 
 			if (range_contains(&range, &dent->dpa_range)) {
 				if (mode == CXL_PARTMODE_DYNAMIC_RAM_A &&
-				    dent->handle != handle)
+				    dent->handle != handle) {
 					dev_warn(dev,
 						"Dynamic RAM perf mismatch; %pra (%u) vs %pra (%u)\n",
 						&range, handle, &dent->dpa_range, dent->handle);
-
+					continue;
+				}
 				update_perf_entry(dev, dent,
 						  &cxlds->part[i].perf);
 				found = true;
