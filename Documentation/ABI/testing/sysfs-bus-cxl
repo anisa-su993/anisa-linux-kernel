@@ -358,8 +358,8 @@ Description:
 
 
 What:		/sys/bus/cxl/devices/decoderX.Y/mode
-Date:		May, 2022, May 2025
-KernelVersion:	v6.0, v6.16 (dynamic_ram_a)
+Date:		May, 2022, June 2026
+KernelVersion:	v6.0, v7.3 (dynamic_ram_a)
 Contact:	linux-cxl@vger.kernel.org
 Description:
 		(RW) When a CXL decoder is of devtype "cxl_decoder_endpoint" it
