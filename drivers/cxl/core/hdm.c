@@ -479,7 +479,7 @@ int cxl_dpa_setup(struct cxl_dev_state *cxlds, const struct cxl_dpa_info *info)
 
 	/* Verify partitions are in expected order. */
 	for (i = 1; i < info->nr_partitions; i++) {
-		if (cxlds->part[i].mode < cxlds->part[i-1].mode) {
+		if (info->part[i].mode < info->part[i-1].mode) {
 			dev_err(dev, "Partition order mismatch\n");
 			return -EINVAL;
 		}
