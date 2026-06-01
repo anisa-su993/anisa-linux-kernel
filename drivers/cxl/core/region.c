@@ -2395,6 +2395,7 @@ static size_t store_targetN(struct cxl_region *cxlr, const char *buf, int pos,
 		rc = detach_target(cxlr, pos);
 	else {
 		struct cxl_endpoint_decoder *cxled;
+		struct cxl_memdev_state *mds;
 		struct device *dev;
 
 		dev = bus_find_device_by_name(&cxl_bus_type, NULL, buf);
@@ -2407,11 +2408,18 @@ static size_t store_targetN(struct cxl_region *cxlr, const char *buf, int pos,
 		}
 
 		cxled = to_cxl_endpoint_decoder(dev);
-		if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A &&
-		    !cxl_dcd_supported(cxled_to_mds(cxled))) {
-			dev_dbg(dev, "DCD unsupported\n");
-			rc = -EINVAL;
-			goto out;
+		if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM_A) {
+			mds = cxled_to_mds(cxled);
+			if (!mds) {
+				dev_dbg(dev, "No memdev state\n");
+				rc = -ENODEV;
+				goto out;
+			}
+			if (!cxl_dcd_supported(mds)) {
+				dev_dbg(dev, "DCD unsupported\n");
+				rc = -EINVAL;
+				goto out;
+			}
 		}
 		rc = attach_target(cxlr, cxled, pos, TASK_INTERRUPTIBLE);
 out:

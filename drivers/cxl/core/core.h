@@ -23,9 +23,7 @@ static inline struct cxl_memdev_state *
 cxled_to_mds(struct cxl_endpoint_decoder *cxled)
 {
 	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
-	struct cxl_dev_state *cxlds = cxlmd->cxlds;
-
-	return container_of(cxlds, struct cxl_memdev_state, cxlds);
+	return to_cxl_memdev_state(cxlmd->cxlds);
 }
 
 int cxl_process_extent_list(struct cxl_endpoint_decoder *cxled);

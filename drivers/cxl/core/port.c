@@ -367,6 +367,10 @@ static umode_t cxl_root_decoder_visible(struct kobject *kobj, struct attribute *
 	if (a == CXL_REGION_ATTR(create_ram_region) && !can_create_ram(cxlrd))
 		return 0;
 
+	if (a == CXL_REGION_ATTR(create_dynamic_ram_a_region) &&
+	    !can_create_ram(cxlrd))
+		return 0;
+
 	if (a == CXL_REGION_ATTR(delete_region) &&
 	    !(can_create_pmem(cxlrd) || can_create_ram(cxlrd)))
 		return 0;
