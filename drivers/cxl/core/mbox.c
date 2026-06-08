@@ -1610,9 +1610,6 @@ static int handle_add_event(struct cxl_memdev_state *mds,
 	/*
 	 * Chain is closing.  Disarm before flushing so a pending watchdog
 	 * (queued but blocked on @ctx->lock) sees !armed and bails out.
-	 * cancel_delayed_work() — not _sync — because handle_add_event()
-	 * itself runs on system_wq and a sync cancel of same-wq work can
-	 * deadlock.
 	 */
 	ctx->armed = false;
 	cancel_delayed_work(&ctx->timeout_work);
@@ -2495,7 +2492,6 @@ struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev, u64 serial,
 	mutex_init(&mds->add_ctx.lock);
 	INIT_DELAYED_WORK(&mds->add_ctx.timeout_work,
 			  cxl_dc_add_timeout);
-	mds->add_ctx.armed = false;
 
 	rc = devm_add_action_or_reset(dev, clear_pending_extents, mds);
 	if (rc)
