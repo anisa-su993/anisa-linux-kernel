@@ -1267,10 +1267,10 @@ static void cxl_cancel_dcd_add_chain_work(void *_mds)
 static int add_to_pending_list(struct list_head *pending_list,
 			       struct cxl_extent *to_add)
 {
-	struct cxl_extent_list_node *node;
+	struct cxl_extent_list_node *node __free(kfree) =
+		kzalloc(sizeof(*node), GFP_KERNEL);
 	struct cxl_extent *extent;
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
 	if (!node)
 		return -ENOMEM;
 	extent = kmemdup(to_add, sizeof(*extent), GFP_KERNEL);
@@ -1594,8 +1594,10 @@ static int handle_add_event(struct cxl_memdev_state *mds,
 	guard(mutex)(&ctx->lock);
 
 	rc = add_to_pending_list(&ctx->pending_extents, &event->extent);
-	if (rc)
+	if (rc) {
+		clear_pending_extents(mds);
 		return rc;
+	}
 
 	if (event->flags & CXL_DCD_EVENT_MORE) {
 		dev_dbg(dev, "more bit set; delay the surfacing of extent\n");
