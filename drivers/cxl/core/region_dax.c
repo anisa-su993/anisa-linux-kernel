@@ -58,7 +58,7 @@ static struct cxl_dax_region *cxl_dax_region_alloc(struct cxl_region *cxlr)
 	if (!cxlr_dax)
 		return ERR_PTR(-ENOMEM);
 
-	xa_init_flags(&cxlr_dax->dc_extents, XA_FLAGS_ALLOC);
+	xa_init_flags(&cxlr_dax->dc_extents, XA_FLAGS_ALLOC1);
 	cxlr_dax->hpa_range.start = p->res->start;
 	cxlr_dax->hpa_range.end = p->res->end;
 

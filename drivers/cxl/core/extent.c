@@ -135,8 +135,12 @@ static void free_tag_group(struct cxl_dc_tag_group *group)
 static void dc_extent_release(struct device *dev)
 {
 	struct dc_extent *dc_extent = to_dc_extent(dev);
-	struct cxl_dc_tag_group *group = dc_extent->group;
+	struct cxl_dc_tag_group *group;
 
+	if (!dc_extent)
+		return;
+
+	group = dc_extent->group;
 	cxled_release_extent(dc_extent->cxled, dc_extent);
 	xa_erase(&group->cxlr_dax->dc_extents, dc_extent->dev.id);
 	xa_erase(&group->dc_extents, dc_extent->seq_num);
@@ -279,7 +283,7 @@ static int cxl_validate_extent(struct cxl_memdev_state *mds,
 	}
 
 	cxlr = cxl_dpa_to_region(cxlmd, start_dpa, &cxled);
-	if (!cxlr)
+	if (!cxlr || !cxlr->cxlr_dax)
 		return -ENXIO;
 
 	ed_range = (struct range) {
@@ -393,6 +397,9 @@ int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,
  * one More-chain group share a UUID — enforced here as the group is
  * either being created (first extent) or appended to.  On any failure
  * the dc_extent is freed.
+ *
+ * Returns 1 on success to allow caller (cxl_add_extent) to distinguish
+ * between accepting a new extent, accepting a duplicate, or error.
  */
 static int cxlr_add_extent(struct cxl_memdev_state *mds,
 			   struct cxl_dax_region *cxlr_dax,
@@ -437,9 +444,13 @@ static int cxlr_add_extent(struct cxl_memdev_state *mds,
 		return rc;
 	}
 
-	return 0;
+	return 1;
 }
 
+/*
+ * Returns 1 for a successfully added extent, 0 for a duplicate extent,
+ * and <0 on error
+ */
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		   u16 seq_num)
 {
@@ -479,6 +490,7 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 	dev_dbg(&cxled->cxld.dev, "Add extent %pra (%pU)\n",
 		&dc_extent->dpa_range, &dc_extent->uuid);
 
+	/* returns 1 on success, <0 error*/
 	return cxlr_add_extent(mds, cxlr_dax, dc_extent);
 }
 

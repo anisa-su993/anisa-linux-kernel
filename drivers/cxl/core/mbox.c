@@ -1462,6 +1462,7 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 	int total_accepted = 0;
 
 	while (!list_empty(pending)) {
+		u16 logical_seq = 1;
 		LIST_HEAD(group);
 		struct cxl_dc_tag_group *tag_group;
 		int group_cnt = 0;
@@ -1528,7 +1529,6 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 			continue;
 		}
 
-		u16 logical_seq = 1;
 		list_for_each_entry_safe(pos, tmp, &group, list) {
 			u16 raw = le16_to_cpu(pos->extent->shared_extn_seq);
 			u16 seq = raw ? raw : logical_seq;
@@ -1548,8 +1548,11 @@ static int cxl_add_pending(struct cxl_memdev_state *mds)
 		}
 
 		tag_group = mds->add_ctx.group;
-		if (!tag_group)
+		if (!tag_group) {
+			delete_extent_node(list_first_entry(pending,
+					   struct cxl_extent_list_node, list));
 			continue;
+		}
 
 		rc = online_tag_group(tag_group);
 		if (rc) {
