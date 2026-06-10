@@ -83,7 +83,7 @@ alloc_tag_group(struct cxl_dax_region *cxlr_dax, uuid_t *uuid)
  * The returned pointer is owned by mds->cxlds.part[] and lives for the
  * lifetime of the memdev.
  */
-static const struct cxl_dpa_partition *
+const struct cxl_dpa_partition *
 cxl_extent_dc_partition(struct cxl_memdev_state *mds,
 			struct cxl_extent *extent,
 			struct range *ext_range)
