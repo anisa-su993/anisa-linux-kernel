@@ -80,6 +80,10 @@ int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 int online_tag_group(struct cxl_dc_tag_group *group);
 void rm_tag_group(struct cxl_dc_tag_group *group);
 void discard_tag_group(struct cxl_dc_tag_group *group);
+const struct cxl_dpa_partition *
+cxl_extent_dc_partition(struct cxl_memdev_state *mds,
+			struct cxl_extent *extent,
+			struct range *ext_range);
 #else
 static inline u64 cxl_dpa_to_hpa(struct cxl_region *cxlr,
 				 const struct cxl_memdev *cxlmd, u64 dpa)
@@ -128,6 +132,13 @@ static inline void kill_regions(struct cxl_root_decoder *cxlrd) { };
 #define SET_CXL_REGION_ATTR(x)
 #define CXL_PMEM_REGION_TYPE(x) NULL
 #define CXL_DAX_REGION_TYPE(x) NULL
+static inline const struct cxl_dpa_partition *
+cxl_extent_dc_partition(struct cxl_memdev_state *mds,
+			struct cxl_extent *extent,
+			struct range *ext_range)
+{
+	return NULL;
+}
 #endif
 
 struct cxl_send_command;
