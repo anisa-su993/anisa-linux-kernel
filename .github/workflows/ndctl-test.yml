@@ -1,0 +1,31 @@
+name: run ndctl tests
+
+on:
+  push:
+    branches:
+      - dcd-*
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Kernel branch to test (default: the branch this runs on)'
+        required: false
+        default: ''
+      ndctl_branch:
+        description: 'NDCTL branch to test'
+        required: false
+        default: pending
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger NDCTL Test Runner
+        env:
+          GH_TOKEN: ${{ secrets.NDCTL_RUNNER_TOKEN }}
+        run: |
+          gh workflow run "ndctl-test runner" \
+            --repo anisa-su993/ndctl-test-runner \
+            -f kernel_repo=${{ github.repository }} \
+            -f kernel_branch=${{ github.event.inputs.kernel_branch || github.ref_name }} \
+            -f ndctl_repo=pmem/ndctl \
+            -f ndctl_branch=${{ github.event.inputs.ndctl_branch || 'pending' }} \
+            -f test_suite=cxl
