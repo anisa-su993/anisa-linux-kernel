@@ -1,0 +1,20 @@
+name: run ndctl tests
+
+on:
+  push:
+    branches:
+      - dcd-*
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger NDCTL Test Runner
+        env:
+          GH_TOKEN: ${{ secrets.NDCTL_RUNNER_TOKEN }}
+        run: |
+          gh workflow run "ndctl-test runner" \
+            --repo anisa/ndctl-test-runner \
+            -f kernel_repo=${{ github.repository }} \
+            -f kernel_branch=${{ github.ref_name }} \
+            -f test_suite=cxl
