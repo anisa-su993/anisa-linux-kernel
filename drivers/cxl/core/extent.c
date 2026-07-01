@@ -656,6 +656,7 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 		 * dax_resources alive so we do not free them out from under
 		 * live dev_dax ranges.  The device will retry the release.
 		 */
+		dev_err(&cxlr->cxlr_dax->dev, "ANISA_DBG: release notify failed rc=%d (%pe)\n", rc, ERR_PTR(rc));
 		return 0;
 	}
 

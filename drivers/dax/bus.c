@@ -642,6 +642,7 @@ static void trim_dev_dax_range(struct dev_dax *dev_dax)
 	struct resource *res = &dax_region->res;
 
 	lockdep_assert_held_write(&dax_region_rwsem);
+	dev_err(&dev_dax->dev, "ANISA_DBG: trim dev dax range\n");
 	dev_dbg(&dev_dax->dev, "delete range[%d]: %#llx:%#llx\n", i,
 		(unsigned long long)range->start,
 		(unsigned long long)range->end);
@@ -649,6 +650,7 @@ static void trim_dev_dax_range(struct dev_dax *dev_dax)
 	if (dev_range->dax_resource) {
 		res = dev_range->dax_resource->res;
 		dev_dbg(&dev_dax->dev, "Trim dc extent %pr\n", res);
+		dev_err(&dev_dax->dev, "ANISA_DBG: trim dc extent %pr\n", res);
 	}
 
 	__release_region(res, range->start, range_len(range));
@@ -1185,6 +1187,8 @@ static int dev_dax_shrink(struct dev_dax *dev_dax, resource_size_t size)
 	struct device *dev = &dev_dax->dev;
 	int i;
 
+	dev_err(dev, "ANISA_DBG: destroy dax device (shrink to size %pa)\n", &size);
+
 	for (i = dev_dax->nr_range - 1; i >= 0; i--) {
 		struct dev_dax_range *dev_range = &dev_dax->ranges[i];
 		struct range *range = &dev_range->range;
@@ -1207,6 +1211,7 @@ static int dev_dax_shrink(struct dev_dax *dev_dax, resource_size_t size)
 		 * Partial shrink: forbidden on DC regions, so dev_range
 		 * here must belong to a static device.
 		 */
+		dev_err(dev, "ANISA_DBG: partial shrink (should be impossible)\n");
 		for_each_dax_region_resource(dax_region, res)
 			if (strcmp(res->name, dev_name(dev)) == 0
 					&& res->start == range->start) {
@@ -1339,6 +1344,8 @@ static ssize_t dev_dax_resize(struct dax_region *dax_region,
 	struct device *dev = &dev_dax->dev;
 	resource_size_t to_alloc;
 	ssize_t alloc;
+
+	dev_err(&dev_dax->dev, "ANISA_DBG: resize dev dax range\n");
 
 	if (dev->driver)
 		return -EBUSY;
