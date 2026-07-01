@@ -188,11 +188,12 @@ static void __dax_release_resource(struct dax_resource *dax_resource)
 	struct dax_region *dax_region = dax_resource->region;
 
 	lockdep_assert_held_write(&dax_region_rwsem);
-	dev_dbg(dax_region->dev, "Extent release resource %pr\n",
-		dax_resource->res);
-	if (dax_resource->res)
+	if (dax_resource->res) {
+		dev_dbg(dax_region->dev, "Extent release resource %pr\n",
+			dax_resource->res);
 		__release_region(&dax_region->res, dax_resource->res->start,
 				 resource_size(dax_resource->res));
+	}
 	dax_resource->res = NULL;
 }
 
@@ -220,7 +221,7 @@ static int __dax_region_add_resource(struct dax_region *dax_region,
 	if (!dax_resource)
 		return -ENOMEM;
 
-	dev_dbg(dax_region->dev, "DAX region resource %pr\n", &dax_region->res);
+	dev_dbg(dax_region->dev, "request region resource %pr\n", &dax_region->res);
 	new_resource = __request_region(&dax_region->res, start, length, "extent", 0);
 	if (!new_resource) {
 		dev_err(dax_region->dev, "Failed to add region s:%pa l:%pa\n",
