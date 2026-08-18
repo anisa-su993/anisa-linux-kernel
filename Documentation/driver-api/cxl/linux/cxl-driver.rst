@@ -181,6 +181,69 @@ A Memory Device is a discrete base object that is not a port.  While the
 physical device it belongs to may also host an `endpoint`, the relationship
 between an `endpoint` and a `memdev` is not captured in sysfs.
 
+DPA Partitions
+~~~~~~~~~~~~~~
+A memory device presents its capacity as one flat `Device Physical Address`
+(DPA) space divided into `partitions`, which Linux lays out in a fixed
+order::
+
+  DPA 0                                                     end
+  +---------------+---------------+---------------------------+
+  |      ram      |     pmem      |       dynamic_ram_1       |
+  +---------------+---------------+---------------------------+
+    part[0]         part[1]         part[2]
+
+Part of that order is required by the CXL specification and part of it is a
+Linux choice.  The distinction matters when reasoning about a device Linux
+declines to configure.
+
+The `ram` and `pmem` order is mandated.  CXL r4.0 section 8.2.10.9.21 "Get
+Partition Info" (opcode 4100h), Table 8-310, places volatile capacity at DPA
+0 and persistent capacity at the DPA immediately following it.  Neither the
+device nor Linux has any freedom here.
+
+Dynamic Capacity partitions are not mandated.  CXL r4.0 section 8.2.10.9.9.1
+"Get Dynamic Capacity Configuration" (opcode 4800h), Table 8-347, requires
+only that each DC Region Base be 256MB aligned.  A conforming device may
+leave a gap between static capacity and its first DC partition, or between
+one DC partition and the next.
+
+Linux follows the static precedent anyway for the partition it maps: the
+first DC partition must begin at the DPA immediately following pmem, or
+following ram on a device with no pmem.  The reason is the shape of the
+device's DPA resource tree, :code:`cxlds->dpa_res`.  It is a single span
+from DPA 0 to the sum of the partition capacities, with each partition
+requested as a child of it, so a partition sitting above a hole would end
+past the parent and fail to be inserted.  Supporting holes would mean
+sizing that span by the last partition's end rather than by capacity.
+Nothing needs that today.
+
+Three places enforce the layout:
+
+* :code:`cxl_dpa_setup()` (:code:`drivers/cxl/core/hdm.c`) rejects partitions
+  that are out of mode order or not contiguous.  This applies to every
+  partition Linux maps, static or dynamic.
+* :code:`cxl_configure_dcd()` (:code:`drivers/cxl/core/mbox.c`) reports a DC
+  partition overlapping static capacity as a device bug (:code:`-EINVAL`),
+  and a gap above static capacity as a layout Linux does not support
+  (:code:`-EOPNOTSUPP`).  On either, :code:`cxl_pci_probe()` disables DCD and
+  carries on, so the device keeps its static capacity.
+* :code:`cxl_dc_check()` (:code:`drivers/cxl/core/mbox.c`) validates every DC
+  partition the device reports, but requires only that they do not overlap.
+  Linux configures the first DC partition and no others, so a gap between
+  partitions it never maps is not a reason to disable DCD.
+
+Only one dynamic partition is supported.  A device may report up to eight
+(CXL r4.0 Table 8-346); Linux configures the first and exposes it as
+`dynamic_ram_1`, whose trailing digit counts dynamic partitions rather than
+naming the device's DC partition index.  The rest are read and validated, so
+that a malformed configuration is still caught, but they are not turned into
+usable capacity.
+
+Support for additional dynamic partitions may be added if devices appear
+that need it, which is what the `dynamic_ram_1` name leaves room for.  Until
+then a device offering more than one is still usable, just not in full.
+
 Port Relationships
 ~~~~~~~~~~~~~~~~~~
 In our example described above, there are four host bridges attached to the
