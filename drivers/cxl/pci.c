@@ -545,7 +545,12 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 		status &= mask;
 		if (!status)
 			break;
-		cxl_mem_get_event_records(mds, status);
+		/*
+		 * A failed drain leaves the log's status bit set, so retrying
+		 * here would spin forever on the same records.
+		 */
+		if (cxl_mem_get_event_records(mds, status))
+			break;
 		cond_resched();
 	} while (status);
 
