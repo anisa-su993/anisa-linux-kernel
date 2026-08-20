@@ -1823,6 +1823,9 @@ static int cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 			.min_out = struct_size(payload, records, 0),
 		};
 
+		cxl_dbgp(dev, "get_records_log: type=%d size_out=%zu\n",
+			 type, mbox_cmd.size_out);
+
 		rc = cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
 		if (rc) {
 			dev_err_ratelimited(dev,
@@ -1832,6 +1835,8 @@ static int cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 		}
 
 		nr_rec = le16_to_cpu(payload->record_count);
+		cxl_dbgp(dev, "get_records_log: type=%d nr_rec=%u flags=%#x\n",
+			 type, nr_rec, payload->flags);
 		if (!nr_rec)
 			break;
 
@@ -1847,6 +1852,8 @@ static int cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 			trace_cxl_overflow(cxlmd, type, payload);
 
 		rc = cxl_clear_event_record(mds, type, payload);
+		cxl_dbgp(dev, "get_records_log: type=%d cleared %u recs rc=%d\n",
+			 type, nr_rec, rc);
 		if (rc) {
 			dev_err_ratelimited(dev,
 				"Event log '%d': Failed to clear events : %d",
@@ -1879,7 +1886,9 @@ int cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status)
 {
 	int rc, ret = 0;
 
-	dev_dbg(mds->cxlds.dev, "Reading event logs: %x\n", status);
+	cxl_dbgp(mds->cxlds.dev,
+		 "get_event_records: status=%#x dcd_supported=%d\n",
+		 status, cxl_dcd_supported(mds));
 
 	if (cxl_dcd_supported(mds) && (status & CXLDEV_EVENT_STATUS_DCD)) {
 		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_DCD);
@@ -1901,6 +1910,9 @@ int cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status)
 		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_INFO);
 		ret = ret ?: rc;
 	}
+
+	cxl_dbgp(mds->cxlds.dev, "get_event_records: status=%#x ret=%d\n",
+		 status, ret);
 
 	return ret;
 }
@@ -2554,6 +2566,7 @@ int cxl_configure_dcd(struct cxl_memdev_state *mds, struct cxl_dpa_info *info)
 	int rc;
 
 	rc = cxl_dev_dc_identify(&mds->cxlds.cxl_mbox, &dc_info);
+	cxl_dbgp(dev, "configure_dcd: Get DC Config rc=%d\n", rc);
 	if (rc) {
 		dev_warn(dev,
 			 "Failed to read Dynamic Capacity config: %d\n", rc);
@@ -2576,6 +2589,8 @@ int cxl_configure_dcd(struct cxl_memdev_state *mds, struct cxl_dpa_info *info)
 	}
 
 	info->size += dc_info.size;
+	cxl_dbgp(dev, "configure_dcd: start=%#llx size=%#llx handle=%#x\n",
+		 dc_info.start, dc_info.size, dc_info.handle);
 	dev_dbg(dev, "Adding dynamic ram partition 1; %#llx size %#llx\n",
 		dc_info.start, dc_info.size);
 	add_part(info, dc_info.start, dc_info.size, CXL_PARTMODE_DYNAMIC_RAM_1,
