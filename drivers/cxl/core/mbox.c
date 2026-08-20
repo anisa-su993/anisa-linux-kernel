@@ -1799,7 +1799,8 @@ static void cxl_handle_dcd_event_records(struct cxl_memdev_state *mds,
 }
 
 static int cxl_mem_get_records_log(struct cxl_memdev_state *mds,
-				   enum cxl_event_log_type type)
+				   enum cxl_event_log_type type,
+				   unsigned int *drained)
 {
 	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
@@ -1839,6 +1840,7 @@ static int cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 			 type, nr_rec, payload->flags);
 		if (!nr_rec)
 			break;
+		*drained += nr_rec;
 
 		for (i = 0; i < nr_rec; i++) {
 			__cxl_event_trace_record(cxlmd, type,
@@ -1871,48 +1873,55 @@ static int cxl_mem_get_records_log(struct cxl_memdev_state *mds,
  * cxl_mem_get_event_records - Get Event Records from the device
  * @mds: The driver data for the operation
  * @status: Event Status register value identifying which events are available.
+ * @drained: Number of records read across every log in @status.
  *
  * Retrieve all event records available on the device, report them as trace
  * events, and clear them.
  *
  * Return: 0 on success, or the first error hit while draining a log. A
  * failure leaves that log's status bit set, so callers polling the status
- * register must not retry indefinitely.
+ * register must not retry indefinitely. @drained is zero when a log reports
+ * its status bit set but returns no records, which is equally unrecoverable
+ * by retrying.
  *
  * See CXL rev 3.0 @8.2.9.2.2 Get Event Records
  * See CXL rev 3.0 @8.2.9.2.3 Clear Event Records
  */
-int cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status)
+int cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status,
+			      unsigned int *drained)
 {
 	int rc, ret = 0;
+
+	*drained = 0;
 
 	cxl_dbgp(mds->cxlds.dev,
 		 "get_event_records: status=%#x dcd_supported=%d\n",
 		 status, cxl_dcd_supported(mds));
 
 	if (cxl_dcd_supported(mds) && (status & CXLDEV_EVENT_STATUS_DCD)) {
-		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_DCD);
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_DCD, drained);
 		ret = ret ?: rc;
 	}
 	if (status & CXLDEV_EVENT_STATUS_FATAL) {
-		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FATAL);
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FATAL, drained);
 		ret = ret ?: rc;
 	}
 	if (status & CXLDEV_EVENT_STATUS_FAIL) {
-		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FAIL);
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FAIL, drained);
 		ret = ret ?: rc;
 	}
 	if (status & CXLDEV_EVENT_STATUS_WARN) {
-		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_WARN);
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_WARN, drained);
 		ret = ret ?: rc;
 	}
 	if (status & CXLDEV_EVENT_STATUS_INFO) {
-		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_INFO);
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_INFO, drained);
 		ret = ret ?: rc;
 	}
 
-	cxl_dbgp(mds->cxlds.dev, "get_event_records: status=%#x ret=%d\n",
-		 status, ret);
+	cxl_dbgp(mds->cxlds.dev,
+		 "get_event_records: status=%#x drained=%u ret=%d\n",
+		 status, *drained, ret);
 
 	return ret;
 }

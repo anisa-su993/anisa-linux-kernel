@@ -542,6 +542,7 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 	struct pci_host_bridge *host_bridge =
 		pci_find_host_bridge(to_pci_dev(cxlds->dev)->bus);
 	u32 mask = cxl_event_drain_mask(host_bridge, mds);
+	unsigned int drained;
 	u32 status;
 	int rc;
 
@@ -563,11 +564,24 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 		 * A failed drain leaves the log's status bit set, so retrying
 		 * here would spin forever on the same records.
 		 */
-		rc = cxl_mem_get_event_records(mds, status);
-		cxl_dbgp(cxlds->dev, "event_thread: drain status=%#x rc=%d\n",
-			 status, rc);
+		rc = cxl_mem_get_event_records(mds, status, &drained);
+		cxl_dbgp(cxlds->dev,
+			 "event_thread: drain status=%#x drained=%u rc=%d\n",
+			 status, drained, rc);
 		if (rc)
 			break;
+		/*
+		 * A device may leave a log's status bit set while returning no
+		 * records, so the next pass would read the same status and
+		 * drain nothing again.  Only the device can clear that state;
+		 * stop rather than spin on it.
+		 */
+		if (!drained) {
+			dev_warn_once(cxlds->dev,
+				      "Event status %#x set with no records to read\n",
+				      status);
+			break;
+		}
 		cond_resched();
 	} while (status);
 
@@ -846,9 +860,12 @@ static int cxl_event_config(struct pci_host_bridge *host_bridge,
 	mask = cxl_event_drain_mask(host_bridge, mds);
 	cxl_dbgp(mds->cxlds.dev, "event_config: probe drain mask=%#x\n", mask);
 	if (mask) {
-		int drc = cxl_mem_get_event_records(mds, mask);
+		unsigned int drained;
+		int drc = cxl_mem_get_event_records(mds, mask, &drained);
 
-		cxl_dbgp(mds->cxlds.dev, "event_config: probe drain rc=%d\n", drc);
+		cxl_dbgp(mds->cxlds.dev,
+			 "event_config: probe drain drained=%u rc=%d\n",
+			 drained, drc);
 	}
 
 	dev_dbg(mds->cxlds.dev, "Event config : %s DCD %s\n",
