@@ -707,6 +707,19 @@ static bool cxl_event_int_is_fw(u8 setting)
 	return mode == CXL_INT_FW;
 }
 
+/*
+ * CXL r3.2 Table 8-234: the Dynamic Capacity event log defines only 00b (no
+ * interrupts) and 01b (MSI/MSI-X).  Unlike the four memory logs it has no FW
+ * Interrupt mode, so 10b and 11b are reserved and a device reporting either
+ * is telling the host something that cannot be honoured.
+ */
+static bool cxl_dcd_int_mode_reserved(u8 setting)
+{
+	u8 mode = FIELD_GET(CXLDEV_EVENT_INT_MODE_MASK, setting);
+
+	return mode != CXL_INT_NONE && mode != CXL_INT_MSI_MSIX;
+}
+
 static bool cxl_event_fw_owns_mem_logs(struct cxl_event_interrupt_policy *policy)
 {
 	return cxl_event_int_is_fw(policy->info_settings) ||
@@ -756,6 +769,15 @@ static int cxl_event_config(struct pci_host_bridge *host_bridge,
 		dev_warn(mds->cxlds.dev,
 			 "DCD supported but interrupt policy is only %zu bytes\n",
 			 policy_size);
+		cxl_disable_dcd(mds);
+	}
+
+	if (cxl_dcd_supported(mds) && policy_size >= sizeof(policy) &&
+	    cxl_dcd_int_mode_reserved(policy.dcd_settings)) {
+		dev_warn(mds->cxlds.dev,
+			 "DC event log interrupt mode %#x is reserved, disabling DCD\n",
+			 (u8)FIELD_GET(CXLDEV_EVENT_INT_MODE_MASK,
+				       policy.dcd_settings));
 		cxl_disable_dcd(mds);
 	}
 
