@@ -652,12 +652,13 @@ static int cxl_mock_event_trigger(struct device *dev)
 {
 	struct cxl_mockmem_data *mdata = dev_get_drvdata(dev);
 	struct mock_event_store *mes = &mdata->mes;
+	unsigned int drained;
 	int rc;
 
 	rc = cxl_mock_add_event_logs(mdata);
 	if (rc)
 		return rc;
-	cxl_mem_get_event_records(mdata->mds, mes->ev_status);
+	cxl_mem_get_event_records(mdata->mds, mes->ev_status, &drained);
 
 	return 0;
 }
@@ -2249,6 +2250,7 @@ static int cxl_mock_mem_probe(struct platform_device *pdev)
 	struct cxl_mockmem_data *mdata;
 	struct cxl_mailbox *cxl_mbox;
 	struct cxl_dpa_info range_info = { 0 };
+	unsigned int probe_drained;
 	u64 serial;
 	int rc;
 
@@ -2363,7 +2365,7 @@ static int cxl_mock_mem_probe(struct platform_device *pdev)
 	if (rc)
 		dev_dbg(dev, "No CXL FWCTL setup\n");
 
-	cxl_mem_get_event_records(mds, CXLDEV_EVENT_STATUS_ALL);
+	cxl_mem_get_event_records(mds, CXLDEV_EVENT_STATUS_ALL, &probe_drained);
 	cxl_mock_test_feat_init(mdata);
 
 	return 0;
@@ -2499,6 +2501,7 @@ static int log_dc_event(struct cxl_mockmem_data *mdata, enum dc_event type,
 {
 	struct device *dev = mdata->mds->cxlds.dev;
 	struct cxl_test_dcd *dcd_event;
+	unsigned int drained;
 	uuid_t tag;
 	int rc;
 
@@ -2527,7 +2530,7 @@ static int log_dc_event(struct cxl_mockmem_data *mdata, enum dc_event type,
 		      (struct cxl_event_record_raw *)dcd_event);
 
 	/* Fake the irq */
-	cxl_mem_get_event_records(mdata->mds, CXLDEV_EVENT_STATUS_DCD);
+	cxl_mem_get_event_records(mdata->mds, CXLDEV_EVENT_STATUS_DCD, &drained);
 
 	return 0;
 }

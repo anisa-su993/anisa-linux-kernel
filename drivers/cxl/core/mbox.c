@@ -1769,8 +1769,9 @@ static void cxl_handle_dcd_event_records(struct cxl_memdev_state *mds,
 		dev_err_ratelimited(dev, "dcd event failed: %d\n", rc);
 }
 
-static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
-				    enum cxl_event_log_type type)
+static int cxl_mem_get_records_log(struct cxl_memdev_state *mds,
+				   enum cxl_event_log_type type,
+				   unsigned int *drained)
 {
 	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
@@ -1778,12 +1779,13 @@ static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 	struct cxl_get_event_payload *payload;
 	u8 log_type = type;
 	u16 nr_rec;
+	int rc = 0;
 
 	mutex_lock(&mds->event.log_lock);
 	payload = mds->event.buf;
 
 	do {
-		int rc, i;
+		int i;
 		struct cxl_mbox_cmd mbox_cmd = (struct cxl_mbox_cmd) {
 			.opcode = CXL_MBOX_OP_GET_EVENT_RECORD,
 			.payload_in = &log_type,
@@ -1804,6 +1806,7 @@ static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 		nr_rec = le16_to_cpu(payload->record_count);
 		if (!nr_rec)
 			break;
+		*drained += nr_rec;
 
 		for (i = 0; i < nr_rec; i++) {
 			__cxl_event_trace_record(cxlmd, type,
@@ -1826,6 +1829,8 @@ static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
 	} while (nr_rec);
 
 	mutex_unlock(&mds->event.log_lock);
+
+	return rc;
 }
 
 /**
@@ -1839,20 +1844,37 @@ static void cxl_mem_get_records_log(struct cxl_memdev_state *mds,
  * See CXL rev 3.0 @8.2.9.2.2 Get Event Records
  * See CXL rev 3.0 @8.2.9.2.3 Clear Event Records
  */
-void cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status)
+int cxl_mem_get_event_records(struct cxl_memdev_state *mds, u32 status,
+			      unsigned int *drained)
 {
+	int rc, ret = 0;
+
 	dev_dbg(mds->cxlds.dev, "Reading event logs: %x\n", status);
 
-	if (cxl_dcd_supported(mds) && (status & CXLDEV_EVENT_STATUS_DCD))
-		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_DCD);
-	if (status & CXLDEV_EVENT_STATUS_FATAL)
-		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FATAL);
-	if (status & CXLDEV_EVENT_STATUS_FAIL)
-		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FAIL);
-	if (status & CXLDEV_EVENT_STATUS_WARN)
-		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_WARN);
-	if (status & CXLDEV_EVENT_STATUS_INFO)
-		cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_INFO);
+	*drained = 0;
+
+	if (cxl_dcd_supported(mds) && (status & CXLDEV_EVENT_STATUS_DCD)) {
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_DCD, drained);
+		ret = ret ?: rc;
+	}
+	if (status & CXLDEV_EVENT_STATUS_FATAL) {
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FATAL, drained);
+		ret = ret ?: rc;
+	}
+	if (status & CXLDEV_EVENT_STATUS_FAIL) {
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_FAIL, drained);
+		ret = ret ?: rc;
+	}
+	if (status & CXLDEV_EVENT_STATUS_WARN) {
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_WARN, drained);
+		ret = ret ?: rc;
+	}
+	if (status & CXLDEV_EVENT_STATUS_INFO) {
+		rc = cxl_mem_get_records_log(mds, CXL_EVENT_TYPE_INFO, drained);
+		ret = ret ?: rc;
+	}
+
+	return ret;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_mem_get_event_records, "CXL");
 

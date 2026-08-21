@@ -516,8 +516,10 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
 	struct pci_host_bridge *host_bridge =
 		pci_find_host_bridge(to_pci_dev(cxlds->dev)->bus);
+	unsigned int drained;
 	u32 status;
 	u32 mask;
+	int rc;
 
 	/*
 	 * Only drain logs the driver owns.  When BIOS owns event reporting
@@ -538,7 +540,27 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 		status &= mask;
 		if (!status)
 			break;
-		cxl_mem_get_event_records(mds, status);
+
+		/*
+		 * A failed drain leaves the log's status bit set, so retrying
+		 * here would spin forever on the same records.
+		 */
+		rc = cxl_mem_get_event_records(mds, status, &drained);
+		if (rc)
+			break;
+
+		/*
+		 * A device may leave a log's status bit set while returning no
+		 * records, so the next pass would read the same status and
+		 * drain nothing again.  Only the device can clear that state;
+		 * stop rather than spin on it.
+		 */
+		if (!drained) {
+			dev_warn_once(cxlds->dev,
+				      "Event status %#x set with no records to read\n",
+				      status);
+			break;
+		}
 		cond_resched();
 	} while (status);
 
@@ -748,8 +770,12 @@ static int cxl_event_config(struct pci_host_bridge *host_bridge,
 	if (rc)
 		return rc;
 
-	if (native_cxl)
-		cxl_mem_get_event_records(mds, CXLDEV_EVENT_STATUS_ALL);
+	if (native_cxl) {
+		unsigned int drained;
+
+		cxl_mem_get_event_records(mds, CXLDEV_EVENT_STATUS_ALL,
+					  &drained);
+	}
 
 	dev_dbg(mds->cxlds.dev, "Event config : %s DCD %s\n",
 		native_cxl ? "OS" : "BIOS",
