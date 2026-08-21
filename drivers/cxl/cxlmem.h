@@ -929,6 +929,9 @@ void cxl_event_trace_record(struct cxl_memdev *cxlmd,
 int cxl_get_dirty_count(struct cxl_memdev_state *mds, u32 *count);
 int cxl_arm_dirty_shutdown(struct cxl_memdev_state *mds);
 
+/* DBG: temporary instrumentation, not for submission */
+#define cxl_dbgp(dev, fmt, ...) dev_info(dev, "DBG " fmt, ##__VA_ARGS__)
+
 static inline bool cxl_dcd_supported(struct cxl_memdev_state *mds)
 {
 	return mds->dcd_supported;

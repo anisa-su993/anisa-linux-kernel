@@ -225,6 +225,10 @@ static int __cxl_pci_mbox_send_cmd(struct cxl_mailbox *cxl_mbox,
 	 * also happen in any order (though some orders might not make sense).
 	 */
 
+	cxl_dbgp(dev, "mbox: opcode=%#04x size_in=%zu doorbell_busy=%d\n",
+		 mbox_cmd->opcode, mbox_cmd->size_in,
+		 !!cxl_doorbell_busy(cxlds));
+
 	/* #1 */
 	if (cxl_doorbell_busy(cxlds)) {
 		u64 md_status =
@@ -277,6 +281,8 @@ static int __cxl_pci_mbox_send_cmd(struct cxl_mailbox *cxl_mbox,
 	status_reg = readq(cxlds->regs.mbox + CXLDEV_MBOX_STATUS_OFFSET);
 	mbox_cmd->return_code =
 		FIELD_GET(CXLDEV_MBOX_STATUS_RET_CODE_MASK, status_reg);
+	cxl_dbgp(dev, "mbox: opcode=%#04x doorbell cleared, dev rc=%d\n",
+		 mbox_cmd->opcode, mbox_cmd->return_code);
 
 	/*
 	 * Handle the background command in a synchronous manner.
@@ -530,12 +536,19 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 	mask = host_bridge->native_cxl_error ? CXLDEV_EVENT_STATUS_ALL
 					     : CXLDEV_EVENT_STATUS_DCD;
 
+	cxl_dbgp(cxlds->dev,
+		 "event_thread: enter irq=%d native_cxl_error=%d dcd_supported=%d mask=%#x\n",
+		 irq, host_bridge->native_cxl_error, cxl_dcd_supported(mds),
+		 mask);
+
 	do {
 		/*
 		 * CXL 3.0 8.2.8.3.1: The lower 32 bits are the status;
 		 * ignore the reserved upper 32 bits
 		 */
 		status = readl(cxlds->regs.status + CXLDEV_DEV_EVENT_STATUS_OFFSET);
+		cxl_dbgp(cxlds->dev, "event_thread: status=%#x masked=%#x\n",
+			 status, status & mask);
 		/* Ignore logs unknown to the driver or owned by BIOS */
 		status &= mask;
 		if (!status)
@@ -546,6 +559,9 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 		 * here would spin forever on the same records.
 		 */
 		rc = cxl_mem_get_event_records(mds, status, &drained);
+		cxl_dbgp(cxlds->dev,
+			 "event_thread: drain status=%#x drained=%u rc=%d\n",
+			 status, drained, rc);
 		if (rc)
 			break;
 
@@ -577,6 +593,8 @@ static int cxl_event_req_irq(struct cxl_dev_state *cxlds, u8 setting)
 
 	irq =  pci_irq_vector(pdev,
 			      FIELD_GET(CXLDEV_EVENT_INT_MSGNUM_MASK, setting));
+	cxl_dbgp(cxlds->dev, "req_irq: setting=%#x msgnum=%lu irq=%d\n",
+		 setting, FIELD_GET(CXLDEV_EVENT_INT_MSGNUM_MASK, setting), irq);
 	if (irq < 0)
 		return irq;
 
@@ -600,6 +618,12 @@ static int cxl_event_get_int_policy(struct cxl_memdev_state *mds,
 	if (rc < 0)
 		dev_err(mds->cxlds.dev,
 			"Failed to get event interrupt policy : %d", rc);
+	else
+		cxl_dbgp(mds->cxlds.dev,
+			 "get_int_policy: size_out=%zu info=%#x warn=%#x fail=%#x fatal=%#x dcd=%#x\n",
+			 mbox_cmd.size_out, policy->info_settings,
+			 policy->warn_settings, policy->failure_settings,
+			 policy->fatal_settings, policy->dcd_settings);
 
 	return rc;
 }
@@ -634,6 +658,14 @@ static int cxl_event_config_msgnums(struct cxl_memdev_state *mds,
 		.payload_in = policy,
 		.size_in = size_in,
 	};
+
+	cxl_dbgp(mds->cxlds.dev,
+		 "set_int_policy: native_cxl=%d dcd_supported=%d size_in=%zu "
+		 "info=%#x warn=%#x fail=%#x fatal=%#x dcd=%#x\n",
+		 native_cxl, cxl_dcd_supported(mds), size_in,
+		 policy->info_settings, policy->warn_settings,
+		 policy->failure_settings, policy->fatal_settings,
+		 policy->dcd_settings);
 
 	rc = cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
 	if (rc < 0) {
@@ -686,6 +718,10 @@ static int cxl_irqsetup(struct cxl_memdev_state *mds,
 	struct cxl_dev_state *cxlds = &mds->cxlds;
 	int rc;
 
+	cxl_dbgp(cxlds->dev,
+		 "irqsetup: native_cxl=%d dcd_supported=%d dcd_settings=%#x\n",
+		 native_cxl, cxl_dcd_supported(mds), policy->dcd_settings);
+
 	if (native_cxl) {
 		rc = cxl_event_irqsetup(mds, policy);
 		if (rc)
@@ -694,6 +730,7 @@ static int cxl_irqsetup(struct cxl_memdev_state *mds,
 
 	if (cxl_dcd_supported(mds)) {
 		rc = cxl_event_req_irq(cxlds, policy->dcd_settings);
+		cxl_dbgp(cxlds->dev, "irqsetup: DCD irq rc=%d\n", rc);
 		if (rc) {
 			dev_err(cxlds->dev, "Failed to get interrupt for DCD event log\n");
 			cxl_disable_dcd(mds);
@@ -739,8 +776,15 @@ static int cxl_event_config(struct pci_host_bridge *host_bridge,
 	 * If BIOS has control of events and DCD is not supported skip event
 	 * configuration.
 	 */
-	if (!native_cxl && !cxl_dcd_supported(mds))
+	cxl_dbgp(mds->cxlds.dev,
+		 "event_config: native_cxl=%d dcd_supported=%d irq_avail=%d\n",
+		 native_cxl, cxl_dcd_supported(mds), irq_avail);
+
+	if (!native_cxl && !cxl_dcd_supported(mds)) {
+		cxl_dbgp(mds->cxlds.dev,
+			 "event_config: BIOS owns events and no DCD, skipping\n");
 		return 0;
+	}
 
 	if (!irq_avail) {
 		dev_info(mds->cxlds.dev, "No interrupt support, disable event processing.\n");
@@ -772,9 +816,16 @@ static int cxl_event_config(struct pci_host_bridge *host_bridge,
 
 	if (native_cxl) {
 		unsigned int drained;
+		int drc = cxl_mem_get_event_records(mds,
+						    CXLDEV_EVENT_STATUS_ALL,
+						    &drained);
 
-		cxl_mem_get_event_records(mds, CXLDEV_EVENT_STATUS_ALL,
-					  &drained);
+		cxl_dbgp(mds->cxlds.dev,
+			 "event_config: probe drain drained=%u rc=%d\n",
+			 drained, drc);
+	} else {
+		cxl_dbgp(mds->cxlds.dev,
+			 "event_config: BIOS owns events, no probe drain\n");
 	}
 
 	dev_dbg(mds->cxlds.dev, "Event config : %s DCD %s\n",
