@@ -526,7 +526,9 @@ static irqreturn_t cxl_event_thread(int irq, void *id)
 		status &= CXLDEV_EVENT_STATUS_ALL;
 		if (!status)
 			break;
-		cxl_mem_get_event_records(mds, status);
+		/* A log that cannot be read cannot be cleared either */
+		if (cxl_mem_get_event_records(mds, status))
+			break;
 		cond_resched();
 	} while (status);
 
