@@ -233,6 +233,7 @@ static const char *cxl_mem_opcode_to_name(u16 opcode)
  * Return:
  *  * %>=0	- Number of bytes returned in @out.
  *  * %-E2BIG	- Payload is too large for hardware.
+ *  * %-EAGAIN	- Device asked for the command to be retried.
  *  * %-EBUSY	- Couldn't acquire exclusive mailbox access.
  *  * %-EFAULT	- Hardware error occurred.
  *  * %-ENXIO	- Command completed, but device reported an error.

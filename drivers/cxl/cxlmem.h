@@ -164,7 +164,7 @@ static inline struct cxl_ep *cxl_ep_load(struct cxl_port *port,
 	C(INPUT, -ENXIO, "cmd input was invalid"),				\
 	C(UNSUPPORTED, -ENXIO, "cmd is not supported"),				\
 	C(INTERNAL, -ENXIO, "internal device error"),				\
-	C(RETRY, -ENXIO, "temporary error, retry once"),			\
+	C(RETRY, -EAGAIN, "temporary error, retry once"),			\
 	C(BUSY, -ENXIO, "ongoing background operation"),			\
 	C(MEDIADISABLED, -ENXIO, "media access is disabled"),			\
 	C(FWINPROGRESS, -ENXIO,	"one FW package can be transferred at a time"), \
