@@ -518,6 +518,8 @@ struct cxl_region_params {
  * @cxlr_pmem: (for pmem regions) cached copy of the nvdimm bridge
  * @cxlr_dax: (for DC regions) cached copy of CXL DAX bridge
  * @flags: Region state flags
+ * @shareable: DC partitions backing the region are shareable
+ * @read_only: DC partitions backing the region are read-only
  * @params: active + config params for the region
  * @coord: QoS access coordinates for the region
  * @node_notifier: notifier for setting the access coordinates to node
@@ -535,6 +537,8 @@ struct cxl_region {
 	struct cxl_pmem_region *cxlr_pmem;
 	struct cxl_dax_region *cxlr_dax;
 	unsigned long flags;
+	bool shareable;
+	bool read_only;
 	struct cxl_region_params params;
 	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
 	struct notifier_block node_notifier;

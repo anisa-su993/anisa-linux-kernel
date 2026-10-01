@@ -649,7 +649,9 @@ static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
 	else if (cxlr->mode == CXL_PARTMODE_PMEM)
 		desc = "pmem";
 	else if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM)
-		desc = "dynamic_ram";
+		return sysfs_emit(buf, "dynamic_ram%s%s\n",
+				  cxlr->shareable ? "_shared" : "",
+				  cxlr->read_only ? "_ro" : "");
 	else
 		desc = "";
 
@@ -2085,6 +2087,24 @@ static int cxl_region_attach(struct cxl_region *cxlr,
 		return -EINVAL;
 	}
 
+	/*
+	 * A DC region takes its shareable/read-only properties from the
+	 * first partition attached; every other member must match.
+	 */
+	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM) {
+		struct cxl_dpa_partition *part = &cxlds->part[cxled->part];
+
+		if (!p->nr_targets) {
+			cxlr->shareable = part->shareable;
+			cxlr->read_only = part->read_only;
+		} else if (part->shareable != cxlr->shareable ||
+			   part->read_only != cxlr->read_only) {
+			dev_dbg(&cxlr->dev, "%s DC partition flags mismatch\n",
+				dev_name(&cxled->cxld.dev));
+			return -EINVAL;
+		}
+	}
+
 	/* all full of members, or interleave config not established? */
 	if (p->state > CXL_CONFIG_INTERLEAVE_ACTIVE) {
 		dev_dbg(&cxlr->dev, "region already active\n");
@@ -2246,6 +2266,10 @@ static int cxl_region_remove_target(struct device *dev, void *data)
 	for (i = 0; i < p->interleave_ways; i++) {
 		if (p->targets[i] == cxled) {
 			p->nr_targets--;
+			if (!p->nr_targets) {
+				cxlr->shareable = false;
+				cxlr->read_only = false;
+			}
 			cxled->state = CXL_DECODER_STATE_AUTO;
 			cxled->pos = -1;
 			p->targets[i] = NULL;
@@ -2327,6 +2351,10 @@ __cxl_decoder_detach(struct cxl_region *cxlr,
 	}
 	p->targets[cxled->pos] = NULL;
 	p->nr_targets--;
+	if (!p->nr_targets) {
+		cxlr->shareable = false;
+		cxlr->read_only = false;
+	}
 	cxled->cxld.hpa_range = (struct range) {
 		.start = 0,
 		.end = -1,
