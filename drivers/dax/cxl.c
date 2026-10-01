@@ -104,10 +104,13 @@ static int cxl_dax_region_probe(struct device *dev)
 	if (nid == NUMA_NO_NODE)
 		nid = memory_add_physaddr_to_nid(cxlr_dax->hpa_range.start);
 
-	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM)
+	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM) {
 		flags = IORESOURCE_DAX_DCD;
-	else
+		if (cxlr->read_only)
+			flags |= IORESOURCE_DAX_READONLY;
+	} else {
 		flags = IORESOURCE_DAX_KMEM;
+	}
 
 	dax_region = alloc_dax_region(dev, cxlr->id, &cxlr_dax->hpa_range, nid,
 				      PMD_SIZE, flags, &dc_ops);

@@ -391,6 +391,12 @@ static int dev_dax_kmem_probe(struct dev_dax *dev_dax)
 	int adist = MEMTIER_DEFAULT_DAX_ADISTANCE;
 	int online_type = mhp_get_default_online_type();
 
+	/* The device drops writes to read-only capacity; not usable as RAM */
+	if (dev_dax->region->res.flags & IORESOURCE_DAX_READONLY) {
+		dev_warn(dev, "rejecting read-only DAX region for system RAM\n");
+		return -EROFS;
+	}
+
 	/*
 	 * Ensure good NUMA information for the persistent memory.
 	 * Without this check, there is a risk that slow memory
