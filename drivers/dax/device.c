@@ -337,6 +337,10 @@ static int dax_open(struct inode *inode, struct file *filp)
 	struct dev_dax *dev_dax = dax_get_private(dax_dev);
 
 	dev_dbg(&dev_dax->dev, "trace\n");
+	/* The device drops writes to read-only capacity; fail loudly instead */
+	if ((filp->f_mode & FMODE_WRITE) &&
+	    (dev_dax->region->res.flags & IORESOURCE_DAX_READONLY))
+		return -EROFS;
 	inode->i_mapping = __dax_inode->i_mapping;
 	inode->i_mapping->host = __dax_inode;
 	inode->i_mapping->a_ops = &dev_dax_aops;
