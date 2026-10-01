@@ -17,6 +17,7 @@ struct dax_dc_ops;
 #define IORESOURCE_DAX_STATIC BIT(0)
 #define IORESOURCE_DAX_KMEM BIT(1)
 #define IORESOURCE_DAX_DCD BIT(2)
+#define IORESOURCE_DAX_READONLY BIT(3)
 
 #define DAX_KMEM_UNPLUGGED	(-1) /* Do not create memory blocks */
 
