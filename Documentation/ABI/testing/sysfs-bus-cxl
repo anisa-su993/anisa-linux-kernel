@@ -563,6 +563,13 @@ Description:
 		region. For more details on the possible modes see
 		/sys/bus/cxl/devices/decoderX.Y/mode
 
+		A 'dynamic_ram' region also reports the shareable and read-only
+		properties of the dynamic capacity partitions backing it, as
+		'dynamic_ram', 'dynamic_ram_shared', 'dynamic_ram_ro' or
+		'dynamic_ram_shared_ro'. These are taken from the first
+		endpoint decoder attached to the region; every further decoder
+		must come from a partition with the same properties.
+
 
 What:		/sys/bus/cxl/devices/regionZ/resource
 Date:		May, 2022
