@@ -669,7 +669,13 @@ Extents that share a non-null tag form one logical allocation.  Each
 surviving member becomes its own :code:`struct dc_extent` (per-extent
 sysfs device, per-extent HPA range); their containing tag group is an
 internal-only :code:`struct cxl_dc_tag_group` keyed by UUID with no
-sysfs identity.
+sysfs identity.  Each :code:`dc_extent` becomes one
+:code:`dax_resource` on the DAX side, and a tagged DAX device is built
+by claiming every :code:`dax_resource` that carries the tag.
+
+For DAX-side semantics — how accepted extents materialize into
+:code:`dax_resource` objects and DAX devices — see
+:doc:`dax-driver`.
 
 Accepting Extents
 -----------------
@@ -747,19 +753,21 @@ As each surviving extent is attached the host assigns it a 0..n-1
 device-stamped :code:`shared_extn_seq` directly; for non-sharable
 allocations the device sends :code:`shared_extn_seq == 0` and the
 host fills in the arrival-order position (assigned in
-:code:`cxl_realize_group`).
+:code:`cxl_realize_group`).  The DAX layer enforces the same
+:code:`0..n-1` dense invariant in both cases.
 
 The tag group is brought online via :code:`online_tag_group()`,
 which registers every member :code:`dc_extent` as an
-:code:`extentX.Y` child of :code:`cxlr_dax->dev`, and the accepted
-extents are spliced into the response list for a single :code:`ADD_DC_RESPONSE`
+:code:`extentX.Y` child of :code:`cxlr_dax->dev`, the DAX layer is
+notified with :code:`DCD_ADD_CAPACITY`, and the accepted extents are
+spliced into the response list for a single :code:`ADD_DC_RESPONSE`
 mailbox per More-chain.
 
 Releasing Extents
 -----------------
 
 A release may be initiated by the device (a Release Capacity event) or
-by the host (when tearing down a region).
+by the host (when destroying a DAX device or tearing down a region).
 The host-initiated paths tear a tag group down directly through
 :code:`rm_tag_group()`; the device-initiated path goes through the
 release chain in :code:`drivers/cxl/core/mbox.c`.
@@ -795,9 +803,13 @@ Section 9.13.3).  Each extent is decided on its own:
   capacity and may retry.  The rest of the chain still proceeds.
 * An extent that names an owned extent releases its group through
   :code:`cxl_release_tag_group()`: the backing memregion is
-  invalidated once for the group and :code:`rm_tag_group()`
-  unregisters every member :code:`dc_extent` device.  A group whose
-  teardown fails is held the same way.
+  invalidated once for the group, the DAX layer is notified with
+  :code:`DCD_RELEASE_CAPACITY` and consulted for permission, and if it
+  agrees :code:`rm_tag_group()` unregisters every member
+  :code:`dc_extent` device, which cascades through the DAX layer to
+  drop the corresponding :code:`dax_resource`\ s.  If the DAX layer
+  returns :code:`-EBUSY` (the capacity is still mapped or otherwise in
+  use) the group stays intact for the device to retry.
 
 Everything the chain released is acknowledged in a single Release
 Dynamic Capacity command once the chain is flushed, mirroring the Add
