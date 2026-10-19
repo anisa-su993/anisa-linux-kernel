@@ -290,6 +290,8 @@ static void cxl_dcd_dsmas_missing(struct cxl_dev_state *cxlds, const char *why)
 	dev_warn(cxlds->dev, "DC partition has no valid DSMAS entry (%s), disabling DCD\n",
 		 why);
 	cxl_disable_dcd(mds);
+	/* The memdev is already registered; hide its dynamic_ram_1 group */
+	cxl_memdev_update_perf(cxlds->cxlmd);
 }
 
 enum cxl_dsmas_apply {
