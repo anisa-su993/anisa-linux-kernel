@@ -103,6 +103,32 @@ static ssize_t pmem_size_show(struct device *dev, struct device_attribute *attr,
 static struct device_attribute dev_attr_pmem_size =
 	__ATTR(size, 0444, pmem_size_show, NULL);
 
+/* The @nth dynamic ram partition in DPA order, or NULL */
+static struct cxl_dpa_partition *cxl_dc_partition(struct cxl_dev_state *cxlds,
+						  int nth)
+{
+	for (int i = 0; i < cxlds->nr_partitions; i++) {
+		if (cxlds->part[i].mode != CXL_PARTMODE_DYNAMIC_RAM)
+			continue;
+		if (!nth--)
+			return &cxlds->part[i];
+	}
+	return NULL;
+}
+
+static ssize_t dynamic_ram_1_size_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+	struct cxl_dpa_partition *part = cxl_dc_partition(cxlmd->cxlds, 0);
+	unsigned long long len = resource_size(&part->res);
+
+	return sysfs_emit(buf, "%#llx\n", len);
+}
+
+static struct device_attribute dev_attr_dynamic_ram_1_size =
+	__ATTR(size, 0444, dynamic_ram_1_size_show, NULL);
+
 static ssize_t serial_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
@@ -445,6 +471,52 @@ static struct attribute *cxl_memdev_pmem_attributes[] = {
 	NULL,
 };
 
+static ssize_t dynamic_ram_1_qos_class_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+	struct cxl_dpa_partition *part = cxl_dc_partition(cxlmd->cxlds, 0);
+
+	return sysfs_emit(buf, "%d\n", part->perf.qos_class);
+}
+
+static struct device_attribute dev_attr_dynamic_ram_1_qos_class =
+	__ATTR(qos_class, 0444, dynamic_ram_1_qos_class_show, NULL);
+
+static ssize_t dynamic_ram_1_shareable_show(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+	struct cxl_dpa_partition *part = cxl_dc_partition(cxlmd->cxlds, 0);
+
+	return sysfs_emit(buf, "%d\n", part->shareable);
+}
+
+static struct device_attribute dev_attr_dynamic_ram_1_shareable =
+	__ATTR(shareable, 0444, dynamic_ram_1_shareable_show, NULL);
+
+static ssize_t dynamic_ram_1_read_only_show(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+	struct cxl_dpa_partition *part = cxl_dc_partition(cxlmd->cxlds, 0);
+
+	return sysfs_emit(buf, "%d\n", part->read_only);
+}
+
+static struct device_attribute dev_attr_dynamic_ram_1_read_only =
+	__ATTR(read_only, 0444, dynamic_ram_1_read_only_show, NULL);
+
+static struct attribute *cxl_memdev_dynamic_ram_1_attributes[] = {
+	&dev_attr_dynamic_ram_1_size.attr,
+	&dev_attr_dynamic_ram_1_qos_class.attr,
+	&dev_attr_dynamic_ram_1_shareable.attr,
+	&dev_attr_dynamic_ram_1_read_only.attr,
+	NULL,
+};
+
 static ssize_t ram_qos_class_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -521,6 +593,30 @@ static struct attribute_group cxl_memdev_pmem_attribute_group = {
 	.is_visible = cxl_pmem_visible,
 };
 
+static umode_t cxl_dynamic_ram_1_visible(struct kobject *kobj, struct attribute *a, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+	struct cxl_dev_state *cxlds = cxlmd->cxlds;
+	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
+	struct cxl_dpa_partition *part = cxl_dc_partition(cxlds, 0);
+
+	if (!mds || !cxl_dcd_supported(mds) || !part)
+		return SYSFS_GROUP_INVISIBLE;
+
+	if (a == &dev_attr_dynamic_ram_1_qos_class.attr &&
+	    part->perf.qos_class == CXL_QOS_CLASS_INVALID)
+		return 0;
+
+	return a->mode;
+}
+
+static struct attribute_group cxl_memdev_dynamic_ram_1_attribute_group = {
+	.name = "dynamic_ram_1",
+	.attrs = cxl_memdev_dynamic_ram_1_attributes,
+	.is_visible = cxl_dynamic_ram_1_visible,
+};
+
 static umode_t cxl_memdev_security_visible(struct kobject *kobj,
 					   struct attribute *a, int n)
 {
@@ -549,6 +645,7 @@ static const struct attribute_group *cxl_memdev_attribute_groups[] = {
 	&cxl_memdev_attribute_group,
 	&cxl_memdev_ram_attribute_group,
 	&cxl_memdev_pmem_attribute_group,
+	&cxl_memdev_dynamic_ram_1_attribute_group,
 	&cxl_memdev_security_attribute_group,
 	NULL,
 };
@@ -557,6 +654,7 @@ void cxl_memdev_update_perf(struct cxl_memdev *cxlmd)
 {
 	sysfs_update_group(&cxlmd->dev.kobj, &cxl_memdev_ram_attribute_group);
 	sysfs_update_group(&cxlmd->dev.kobj, &cxl_memdev_pmem_attribute_group);
+	sysfs_update_group(&cxlmd->dev.kobj, &cxl_memdev_dynamic_ram_1_attribute_group);
 }
 EXPORT_SYMBOL_NS_GPL(cxl_memdev_update_perf, "CXL");
 
