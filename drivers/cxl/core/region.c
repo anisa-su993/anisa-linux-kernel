@@ -2866,7 +2866,8 @@ static struct cxl_region *__create_region(struct cxl_root_decoder *cxlrd,
 }
 
 static ssize_t create_region_store(struct device *dev, const char *buf,
-				   size_t len, enum cxl_partition_mode mode)
+				   size_t len, enum cxl_partition_mode mode,
+				   bool shareable, bool read_only)
 {
 	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(dev);
 	struct cxl_region *cxlr;
@@ -2881,7 +2882,7 @@ static ssize_t create_region_store(struct device *dev, const char *buf,
 		return rc;
 
 	cxlr = __create_region(cxlrd, mode, id, CXL_DECODER_HOSTONLYMEM,
-			       false, false);
+			       shareable, read_only);
 	if (IS_ERR(cxlr))
 		return PTR_ERR(cxlr);
 
@@ -2892,7 +2893,8 @@ static ssize_t create_pmem_region_store(struct device *dev,
 					struct device_attribute *attr,
 					const char *buf, size_t len)
 {
-	return create_region_store(dev, buf, len, CXL_PARTMODE_PMEM);
+	return create_region_store(dev, buf, len, CXL_PARTMODE_PMEM, false,
+				   false);
 }
 DEVICE_ATTR_RW(create_pmem_region);
 
@@ -2900,9 +2902,32 @@ static ssize_t create_ram_region_store(struct device *dev,
 				       struct device_attribute *attr,
 				       const char *buf, size_t len)
 {
-	return create_region_store(dev, buf, len, CXL_PARTMODE_RAM);
+	return create_region_store(dev, buf, len, CXL_PARTMODE_RAM, false,
+				   false);
 }
 DEVICE_ATTR_RW(create_ram_region);
+
+/* One create file per DC flavor; the region's flavor is fixed at creation */
+#define CXL_DC_CREATE_REGION_ATTR(name, shareable, read_only)		\
+static ssize_t name##_show(struct device *dev,				\
+			   struct device_attribute *attr, char *buf)	\
+{									\
+	return __create_region_show(to_cxl_root_decoder(dev), buf);	\
+}									\
+static ssize_t name##_store(struct device *dev,				\
+			    struct device_attribute *attr,		\
+			    const char *buf, size_t len)		\
+{									\
+	return create_region_store(dev, buf, len,			\
+				   CXL_PARTMODE_DYNAMIC_RAM, shareable,	\
+				   read_only);				\
+}									\
+DEVICE_ATTR_RW(name)
+
+CXL_DC_CREATE_REGION_ATTR(create_dynamic_ram_region, false, false);
+CXL_DC_CREATE_REGION_ATTR(create_dynamic_ram_shared_region, true, false);
+CXL_DC_CREATE_REGION_ATTR(create_dynamic_ram_ro_region, false, true);
+CXL_DC_CREATE_REGION_ATTR(create_dynamic_ram_shared_ro_region, true, true);
 
 static ssize_t region_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
