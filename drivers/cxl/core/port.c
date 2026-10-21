@@ -390,6 +390,10 @@ static struct attribute *cxl_decoder_root_attrs[] = {
 	&dev_attr_qos_class.attr,
 	SET_CXL_REGION_ATTR(create_pmem_region)
 	SET_CXL_REGION_ATTR(create_ram_region)
+	SET_CXL_REGION_ATTR(create_dynamic_ram_region)
+	SET_CXL_REGION_ATTR(create_dynamic_ram_shared_region)
+	SET_CXL_REGION_ATTR(create_dynamic_ram_ro_region)
+	SET_CXL_REGION_ATTR(create_dynamic_ram_shared_ro_region)
 	SET_CXL_REGION_ATTR(delete_region)
 	NULL,
 };
@@ -417,6 +421,13 @@ static umode_t cxl_root_decoder_visible(struct kobject *kobj, struct attribute *
 		return 0;
 
 	if (a == CXL_REGION_ATTR(create_ram_region) && !can_create_ram(cxlrd))
+		return 0;
+
+	if ((a == CXL_REGION_ATTR(create_dynamic_ram_region) ||
+	     a == CXL_REGION_ATTR(create_dynamic_ram_shared_region) ||
+	     a == CXL_REGION_ATTR(create_dynamic_ram_ro_region) ||
+	     a == CXL_REGION_ATTR(create_dynamic_ram_shared_ro_region)) &&
+	    !can_create_ram(cxlrd))
 		return 0;
 
 	if (a == CXL_REGION_ATTR(delete_region) &&
