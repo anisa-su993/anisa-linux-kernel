@@ -829,12 +829,7 @@ static void cxl_walk_cel(struct cxl_memdev_state *mds, size_t size, u8 *cel)
 	}
 
 	set_features_cap(cxl_mbox, ro_cmds, wr_cmds);
-	/*
-	 * Disabled until event handling implemented.
-	 */
-	if (bitmap_full(dcd_cmds, CXL_DCD_ENABLED_MAX))
-		dev_dbg(dev, "Device supports DCD; capability disabled\n");
-	mds->dcd_supported = false;
+	mds->dcd_supported = bitmap_full(dcd_cmds, CXL_DCD_ENABLED_MAX);
 }
 
 static struct cxl_mbox_get_supported_logs *cxl_get_gsl(struct cxl_memdev_state *mds)
