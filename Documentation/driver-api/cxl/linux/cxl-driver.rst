@@ -712,7 +712,8 @@ fails:
   :code:`0, 1, ..., n-1`: sequences with gaps or duplicates, or that
   do not start at 0, are rejected.  The field is reserved for a
   non-sharable partition and is ignored there; the host orders those
-  extents by arrival.
+  extents by arrival.  The DAX layer enforces the same dense
+  :code:`0..n-1` ordering in both cases.
 * `Partition equality`: every tagged extent in the group must resolve
   to the same DC partition.  A single allocation cannot span
   partitions because CDAT describes sharable / writable / coherency
@@ -745,12 +746,13 @@ whole group:
 
 Surviving tag groups are registered with the device model by
 :code:`online_tag_group()`, which adds every member :code:`dc_extent`
-as an :code:`extentX.Y` child of the :code:`dax_region` device.  The
-host then tells the device which extents it accepted with an Add
-Dynamic Capacity Response (CXL r4.0 Section 8.2.10.9.9.3, opcode 4802h)
-per chain, split across several commands chained with the More flag
-when the extent list outgrows the mailbox payload; an extent left out
-of the response is rejected.
+as an :code:`extentX.Y` child of the :code:`dax_region` device, and
+the DAX layer is notified with :code:`DCD_ADD_CAPACITY`.  The host then
+tells the device which extents it accepted with an Add Dynamic Capacity
+Response (CXL r4.0 Section 8.2.10.9.9.3, opcode 4802h) per chain, split
+across several commands chained with the More flag when the extent list
+outgrows the mailbox payload; an extent left out of the response is
+rejected.
 
 Extents the device already holds for a region, for instance after a
 host crash, are recovered when the region's :code:`dax_region` probes:
@@ -808,10 +810,14 @@ Each extent pending release is processed:
   retains the capacity for the host and may retry.
 * An extent that names an owned extent releases its group through
   :code:`cxl_release_tag_group()`: the backing memregion is
-  invalidated once for the group and :code:`rm_tag_group()`
-  unregisters every member :code:`dc_extent` device.  If the
-  invalidation fails the group is left out of the response, so the
-  device retains the capacity and may retry.
+  invalidated once for the group, the DAX layer is notified with
+  :code:`DCD_RELEASE_CAPACITY` and consulted for permission, and if
+  it agrees :code:`rm_tag_group()` unregisters every member
+  :code:`dc_extent` device, which cascades through the DAX layer to
+  drop the corresponding :code:`dax_resource`\ s.  If the invalidation
+  fails, or the DAX layer refuses with :code:`-EBUSY` (the capacity is
+  still mapped or otherwise in use), the group is left out of the
+  response, so the device retains the capacity and may retry.
 
 After processing the pending list, every extent the host is giving
 back is sent to the device in the Release Dynamic Capacity Response
