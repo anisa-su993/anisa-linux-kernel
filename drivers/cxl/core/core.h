@@ -85,6 +85,7 @@ int cxl_resolve_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		       struct cxl_dc_tag_group **groupp);
 int cxl_release_tag_group(struct cxl_region *cxlr,
 			  struct cxl_dc_tag_group *group);
+int cxl_tag_group_register(struct cxl_dc_tag_group *group);
 bool cxl_tag_already_committed(const uuid_t *tag);
 int online_tag_group(struct cxl_dc_tag_group *group);
 void rm_tag_group(struct cxl_dc_tag_group *group);
@@ -124,6 +125,10 @@ static inline int cxl_release_tag_group(struct cxl_region *cxlr,
 					struct cxl_dc_tag_group *group)
 {
 	return -ENXIO;
+}
+static inline int cxl_tag_group_register(struct cxl_dc_tag_group *group)
+{
+	return 0;
 }
 static inline int online_tag_group(struct cxl_dc_tag_group *group)
 {

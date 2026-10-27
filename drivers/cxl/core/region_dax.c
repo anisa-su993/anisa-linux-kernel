@@ -14,6 +14,7 @@ static void cxl_dax_region_release(struct device *dev)
 	struct cxl_dax_region *cxlr_dax = to_cxl_dax_region(dev);
 
 	xa_destroy(&cxlr_dax->dc_extents);
+	ida_destroy(&cxlr_dax->tag_group_ida);
 	kfree(cxlr_dax);
 }
 
@@ -59,6 +60,7 @@ static struct cxl_dax_region *cxl_dax_region_alloc(struct cxl_region *cxlr)
 		return ERR_PTR(-ENOMEM);
 
 	xa_init_flags(&cxlr_dax->dc_extents, XA_FLAGS_ALLOC1);
+	ida_init(&cxlr_dax->tag_group_ida);
 	cxlr_dax->hpa_range.start = p->res->start;
 	cxlr_dax->hpa_range.end = p->res->end;
 

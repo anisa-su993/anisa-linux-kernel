@@ -61,6 +61,60 @@ static const struct attribute_group dc_extent_attribute_group = {
 
 __ATTRIBUTE_GROUPS(dc_extent_attribute);
 
+static struct cxl_dc_tag_group *to_dc_tag_group(struct device *dev)
+{
+	return container_of(dev, struct cxl_dc_tag_group, dev);
+}
+
+static ssize_t tag_group_uuid_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%pUb\n", &to_dc_tag_group(dev)->uuid);
+}
+static struct device_attribute dev_attr_tag_group_uuid =
+	__ATTR(uuid, 0444, tag_group_uuid_show, NULL);
+
+static ssize_t size_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct cxl_dc_tag_group *group = to_dc_tag_group(dev);
+	struct dc_extent *dc_extent;
+	unsigned long index;
+	u64 size = 0;
+
+	/* Members are fixed once accepted; RCU covers a concurrent teardown */
+	guard(rcu)();
+	xa_for_each(&group->dc_extents, index, dc_extent)
+		size += range_len(&dc_extent->hpa_range);
+
+	return sysfs_emit(buf, "%#llx\n", size);
+}
+static DEVICE_ATTR_RO(size);
+
+static struct attribute *dc_tag_group_attrs[] = {
+	&dev_attr_tag_group_uuid.attr,
+	&dev_attr_size.attr,
+	NULL
+};
+
+static umode_t dc_tag_group_visible(struct kobject *kobj,
+				    struct attribute *a, int n)
+{
+	struct cxl_dc_tag_group *group = to_dc_tag_group(kobj_to_dev(kobj));
+
+	if (a == &dev_attr_tag_group_uuid.attr && uuid_is_null(&group->uuid))
+		return 0;
+
+	return a->mode;
+}
+
+static const struct attribute_group dc_tag_group_attribute_group = {
+	.attrs = dc_tag_group_attrs,
+	.is_visible = dc_tag_group_visible,
+};
+
+__ATTRIBUTE_GROUPS(dc_tag_group_attribute);
+
 /*
  * Host-wide registry of live tag groups with non-null uuids.  Enforces
  * that within this host, a tag uuid identifies exactly one allocation
@@ -112,13 +166,68 @@ bool cxl_tag_already_committed(const uuid_t *tag)
 	return false;
 }
 
-static void free_tag_group(struct cxl_dc_tag_group *group)
+static void dc_tag_group_release(struct device *dev)
 {
+	struct cxl_dc_tag_group *group = to_dc_tag_group(dev);
+
 	cxl_tag_unregister(group);
 	xa_destroy(&group->dc_extents);
 	/* Drop the pin taken in alloc_tag_group(). */
 	put_device(&group->cxlr_dax->dev);
 	kfree(group);
+}
+
+static const struct device_type dc_tag_group_type = {
+	.name = "tag_group",
+	.release = dc_tag_group_release,
+	.groups = dc_tag_group_attribute_groups,
+};
+
+/* Last extent gone: drop the group's own reference, freeing it */
+static void free_tag_group(struct cxl_dc_tag_group *group)
+{
+	put_device(&group->dev);
+}
+
+static void dc_tag_group_unregister(void *_group)
+{
+	struct cxl_dc_tag_group *group = _group;
+
+	device_del(&group->dev);
+	ida_free(&group->cxlr_dax->tag_group_ida, group->dev.id);
+}
+
+/**
+ * cxl_tag_group_register() - surface an accepted tag group in sysfs
+ * @group: tag group whose extents are online and accepted by the DAX layer
+ *
+ * The device is removed by rm_tag_group() or with the dax_region; the
+ * group's memory lives on until its last dc_extent is released.
+ */
+int cxl_tag_group_register(struct cxl_dc_tag_group *group)
+{
+	struct cxl_dax_region *cxlr_dax = group->cxlr_dax;
+	struct device *dev = &group->dev;
+	int id, rc;
+
+	id = ida_alloc(&cxlr_dax->tag_group_ida, GFP_KERNEL);
+	if (id < 0)
+		return id;
+	dev->id = id;
+
+	rc = dev_set_name(dev, "tag_group%d.%d", cxlr_dax->cxlr->id, id);
+	if (rc)
+		goto err_id;
+
+	rc = device_add(dev);
+	if (rc)
+		goto err_id;
+
+	return devm_add_action_or_reset(&cxlr_dax->dev, dc_tag_group_unregister,
+					group);
+err_id:
+	ida_free(&cxlr_dax->tag_group_ida, id);
+	return rc;
 }
 
 static void dc_extent_release(struct device *dev)
@@ -171,9 +280,15 @@ alloc_tag_group(struct cxl_dax_region *cxlr_dax, uuid_t *uuid)
 
 	/*
 	 * Pin cxlr_dax: it is used after cxl_rwsem.region is dropped, so a
-	 * refcount must keep it alive.  Released in free_tag_group().
+	 * refcount must keep it alive.  Released in dc_tag_group_release().
 	 */
 	get_device(&cxlr_dax->dev);
+
+	/* Not added until the allocation is accepted; see cxl_tag_group_register() */
+	device_initialize(&group->dev);
+	device_set_pm_not_required(&group->dev);
+	group->dev.parent = &cxlr_dax->dev;
+	group->dev.type = &dc_tag_group_type;
 
 	return no_free_ptr(group);
 }
@@ -686,8 +801,11 @@ static void dc_tag_group_teardown(void *_group)
  */
 void rm_tag_group(struct cxl_dc_tag_group *group)
 {
-	devm_remove_action_nowarn(&group->cxlr_dax->dev, dc_tag_group_teardown,
-				  group);
+	struct device *region_dev = &group->cxlr_dax->dev;
+
+	if (device_is_registered(&group->dev))
+		devm_release_action(region_dev, dc_tag_group_unregister, group);
+	devm_remove_action_nowarn(region_dev, dc_tag_group_teardown, group);
 	unregister_tag_group(group);
 }
 

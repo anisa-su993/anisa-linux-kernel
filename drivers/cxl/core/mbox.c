@@ -1620,6 +1620,11 @@ static int cxl_realize_group(struct cxl_memdev_state *mds, const uuid_t *tag,
 		goto err_release;
 	}
 
+	/* Sysfs is informational; the allocation stays accepted without it */
+	if (cxl_tag_group_register(tag_group))
+		dev_warn(dev, "Tag %pUb: failed to surface tag group in sysfs\n",
+			 tag);
+
 	return group_cnt;
 
 err_discard:

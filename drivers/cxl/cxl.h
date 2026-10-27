@@ -618,17 +618,21 @@ struct cxl_dax_region {
 	struct xarray dc_extents;
 	/* Set once the probe has read the device's pre-existing extents. */
 	bool extents_scanned;
+	/* ids for the tag_groupX.Y devices registered under this region */
+	struct ida tag_group_ida;
 };
 
 /**
  * struct cxl_dc_tag_group - A tagged dynamic-capacity allocation.
  *
  * Container for the &struct dc_extent siblings that share a tag.  The
- * group has no sysfs identity; userspace sees the individual dc_extents
- * directly under the parent dax_region device.  The group exists to
- * keep tag-scoped invariants (atomic add, atomic release, ordered carve
- * by seq_num) in one place.
+ * group exists to keep tag-scoped invariants (atomic add, atomic release,
+ * ordered carve by seq_num) in one place.  Once the allocation is
+ * accepted it is surfaced as a tag_groupX.Y device next to its extents.
  *
+ * @dev: device representing this group; child of cxlr_dax->dev, added
+ *	only when the allocation has been accepted.  Holds the group's
+ *	memory: the last dc_extent release drops the final reference.
  * @cxlr_dax: back reference to parent region device.
  * @uuid: tag identifying this allocation; same across all member dc_extents.
  * @dc_extents: xarray of &struct dc_extent in this group, indexed by the
@@ -641,6 +645,7 @@ struct cxl_dax_region {
  *		enforces tag uuid uniqueness across all regions and memdevs.
  */
 struct cxl_dc_tag_group {
+	struct device dev;
 	struct cxl_dax_region *cxlr_dax;
 	uuid_t uuid;
 	struct xarray dc_extents;
