@@ -40,9 +40,23 @@ static void cxl_dax_untagged_release(struct device *dev)
 	put_device(&cxlr_dax->dev);
 }
 
+static ssize_t uuid_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	return sysfs_emit(buf, "%pUb\n", &uuid_null);
+}
+static DEVICE_ATTR_RO(uuid);
+
+static struct attribute *cxl_dax_untagged_attrs[] = {
+	&dev_attr_uuid.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(cxl_dax_untagged);
+
 static const struct device_type cxl_dax_untagged_type = {
 	.name = "untagged",
 	.release = cxl_dax_untagged_release,
+	.groups = cxl_dax_untagged_groups,
 };
 
 static bool is_cxl_dax_region(struct device *dev)

@@ -113,6 +113,39 @@ static struct cxl_dc_tag_group *to_dc_tag_group(struct device *dev)
 	return container_of(dev, struct cxl_dc_tag_group, dev);
 }
 
+static ssize_t tag_group_uuid_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%pUb\n", &to_dc_tag_group(dev)->uuid);
+}
+
+static struct device_attribute dev_attr_tag_group_uuid =
+	__ATTR(uuid, 0444, tag_group_uuid_show, NULL);
+
+static ssize_t size_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct cxl_dc_tag_group *group = to_dc_tag_group(dev);
+	struct dc_extent *dc_extent;
+	unsigned long index;
+	u64 size = 0;
+
+	/* Members are fixed once onlined; RCU covers a concurrent teardown */
+	guard(rcu)();
+	xa_for_each(&group->dc_extents, index, dc_extent)
+		size += range_len(&dc_extent->hpa_range);
+
+	return sysfs_emit(buf, "%#llx\n", size);
+}
+static DEVICE_ATTR_RO(size);
+
+static struct attribute *dc_tag_group_attrs[] = {
+	&dev_attr_tag_group_uuid.attr,
+	&dev_attr_size.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(dc_tag_group);
+
 static void dc_tag_group_release(struct device *dev)
 {
 	struct cxl_dc_tag_group *group = to_dc_tag_group(dev);
@@ -127,6 +160,7 @@ static void dc_tag_group_release(struct device *dev)
 static const struct device_type dc_tag_group_type = {
 	.name = "tag_group",
 	.release = dc_tag_group_release,
+	.groups = dc_tag_group_groups,
 };
 
 /* Last extent gone: drop the group's own reference, freeing it */
