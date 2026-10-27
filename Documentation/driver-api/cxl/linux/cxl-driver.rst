@@ -761,7 +761,15 @@ then tells the device which extents it accepted with an Add Dynamic
 Capacity Response (CXL r4.0 Section 8.2.10.9.9.3, opcode 4802h) per
 chain, split across several commands chained with the More flag when
 the extent list outgrows the mailbox payload; an extent left out of
-the response is rejected.
+the response is rejected.  A :code:`tag_groupX.Y` device reports its
+tag as :code:`uuid` and the total :code:`size` of its extents; the
+:code:`untagged` device's :code:`uuid` reads the null UUID.
+
+Each :code:`dc_extent` becomes one :code:`dax_resource` on the DAX
+side, and a tagged DAX device is built by claiming every
+:code:`dax_resource` that carries the tag.  For DAX-side semantics —
+how accepted extents materialize into :code:`dax_resource` objects and
+DAX devices — see :doc:`dax-driver`.
 
 Extents the device already reserves for a region, for instance after a
 host crash, are recovered when the region's :code:`dax_region` probes:

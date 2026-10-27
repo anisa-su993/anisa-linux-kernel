@@ -733,3 +733,32 @@ Description:
 		assigned (CXL r4.0 Table 8-230), this extent's position in the
 		allocation's address space, 0 to n-1 across the group's n
 		extents.  Absent on a non-sharable partition.
+
+
+What:		/sys/bus/cxl/devices/dax_regionX/tag_groupX.Y/uuid
+Date:		November, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) [For Dynamic Capacity regions only] The tag of the
+		allocation whose extentX.Y devices sit under this group.
+
+
+What:		/sys/bus/cxl/devices/dax_regionX/tag_groupX.Y/size
+Date:		November, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) [For Dynamic Capacity regions only] Total length of the
+		group's extents, which is the size of a DAX device created
+		for its tag.
+
+
+What:		/sys/bus/cxl/devices/dax_regionX/untagged/uuid
+Date:		November, 2026
+KernelVersion:	v7.5
+Contact:	linux-cxl@vger.kernel.org
+Description:
+		(RO) [For Dynamic Capacity regions only] Reads the null UUID.
+		The extentX.Y devices under this directory carry no tag and
+		are claimed one at a time.
