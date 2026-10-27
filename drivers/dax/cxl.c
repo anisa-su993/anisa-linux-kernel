@@ -29,11 +29,19 @@ static int cxl_dax_region_probe(struct device *dev)
 	if (!dax_region)
 		return -ENOMEM;
 
-	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM)
+	if (cxlr->mode == CXL_PARTMODE_DYNAMIC_RAM) {
+		int rc;
+
+		/* Recover extents the device still holds for this region */
+		rc = cxl_region_add_existing_extents(cxlr);
+		if (rc)
+			return rc;
+
 		/* Add empty seed dax device */
 		dev_size = 0;
-	else
+	} else {
 		dev_size = range_len(&cxlr_dax->hpa_range);
+	}
 
 	data = (struct dev_dax_data) {
 		.dax_region = dax_region,
