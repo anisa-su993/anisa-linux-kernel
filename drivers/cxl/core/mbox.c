@@ -1608,7 +1608,7 @@ static int cxl_realize_group(struct cxl_memdev_state *mds, const uuid_t *tag,
 		else
 			seq_num++;
 
-		rc = cxl_add_extent(mds, pos->extent, seq_num);
+		rc = cxl_add_extent(mds, pos->extent, seq_num, existing);
 		if (rc < 0) {
 			dev_dbg(dev,
 				"Tag %pUb: dropping group, failed to add extent DPA:%#llx LEN:%#llx\n",
@@ -1708,6 +1708,9 @@ static int cxl_add_pending(struct cxl_memdev_state *mds,
 {
 	LIST_HEAD(accepted);
 	int total_accepted = 0;
+
+	/* Realizing a group builds through mds->dc_chain.group */
+	lockdep_assert_held(&mds->dc_chain.lock);
 
 	/*
 	 * Held across validation, add and online so that cxlr_dax_unpublish()
@@ -2467,6 +2470,180 @@ int cxl_dev_dc_identify(struct cxl_mailbox *mbox,
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_dev_dc_identify, "CXL");
+
+/*
+ * Stage the device's extents inside @dpa_range on @existing.  Returns
+ * -EAGAIN if the list changes while it is being read.
+ */
+static int cxl_read_extent_list(struct cxl_memdev_state *mds,
+				const struct range *dpa_range,
+				struct list_head *existing)
+{
+	u32 current_index, total_read, total_expected, initial_gen_num;
+	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+	struct device *dev = mds->cxlds.dev;
+	struct cxl_mbox_cmd mbox_cmd;
+	u32 max_extent_count;
+	bool first = true;
+	int rc;
+
+	struct cxl_mbox_get_extent_out *extents __free(kvfree) =
+				kvmalloc(cxl_mbox->payload_size, GFP_KERNEL);
+	if (!extents)
+		return -ENOMEM;
+
+	total_read = 0;
+	current_index = 0;
+	total_expected = 0;
+	max_extent_count = (cxl_mbox->payload_size - sizeof(*extents)) /
+			    sizeof(struct cxl_extent);
+	do {
+		u32 nr_returned, current_total, current_gen_num;
+		struct cxl_mbox_get_extent_in get_extent;
+
+		get_extent = (struct cxl_mbox_get_extent_in) {
+			.extent_cnt = cpu_to_le32(max_extent_count),
+			.start_extent_index = cpu_to_le32(current_index),
+		};
+
+		mbox_cmd = (struct cxl_mbox_cmd) {
+			.opcode = CXL_MBOX_OP_GET_DC_EXTENT_LIST,
+			.payload_in = &get_extent,
+			.size_in = sizeof(get_extent),
+			.size_out = cxl_mbox->payload_size,
+			.payload_out = extents,
+			.min_out = sizeof(*extents),
+		};
+
+		rc = cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
+		if (rc < 0)
+			return rc;
+
+		/* Save initial data */
+		if (first) {
+			total_expected = le32_to_cpu(extents->total_extent_count);
+			initial_gen_num = le32_to_cpu(extents->generation_num);
+			first = false;
+		}
+
+		nr_returned = le32_to_cpu(extents->returned_extent_count);
+		if (nr_returned > max_extent_count ||
+		    struct_size(extents, extent, nr_returned) > mbox_cmd.size_out) {
+			dev_err(dev, "Extent list returned %u extents, asked for %u in %zu bytes\n",
+				nr_returned, max_extent_count, mbox_cmd.size_out);
+			return -EIO;
+		}
+		total_read += nr_returned;
+		current_total = le32_to_cpu(extents->total_extent_count);
+		current_gen_num = le32_to_cpu(extents->generation_num);
+
+		dev_dbg(dev, "Got extent list %d-%d of %d generation Num:%d\n",
+			current_index, total_read ? total_read - 1 : 0,
+			current_total, current_gen_num);
+
+		if (current_gen_num != initial_gen_num || total_expected != current_total) {
+			dev_warn(dev, "Extent list change detected; gen %u != %u : cnt %u != %u\n",
+				 current_gen_num, initial_gen_num,
+				 total_expected, current_total);
+			return -EAGAIN;
+		}
+
+		/* No progress with more expected: a buggy device would loop forever. */
+		if (!nr_returned && total_expected > total_read) {
+			dev_warn(dev, "Device returned 0 of %u remaining extents\n",
+				 total_expected - total_read);
+			return -EIO;
+		}
+
+		for (int i = 0; i < nr_returned ; i++) {
+			struct cxl_extent *extent = &extents->extent[i];
+			struct range ext_range;
+
+			ext_range.start = le64_to_cpu(extent->start_dpa);
+			ext_range.end = ext_range.start +
+					le64_to_cpu(extent->length) - 1;
+			dev_dbg(dev, "Processing extent %d/%d %pra (%pUb) seq %u\n",
+				current_index + i, total_expected, &ext_range,
+				extent->uuid,
+				le16_to_cpu(extent->shared_extn_seq));
+			/* Another region's, or an unmapped partition's: not ours */
+			if (!range_contains(dpa_range, &ext_range))
+				continue;
+			rc = stage_pending_extent(existing, extent);
+			if (rc)
+				return rc;
+		}
+
+		current_index += nr_returned;
+	} while (total_expected > total_read);
+
+	return 0;
+}
+
+static int __cxl_process_extent_list(struct cxl_endpoint_decoder *cxled)
+{
+	struct cxl_memdev_state *mds = cxled_to_mds(cxled);
+	struct range dpa_range;
+	LIST_HEAD(existing);
+	int rc;
+
+	/*
+	 * The list covers every DC partition and region of the device; only
+	 * the extents inside this decoder's DPA range are this region's.
+	 */
+	scoped_guard(rwsem_read, &cxl_rwsem.dpa) {
+		if (!cxled->dpa_res)
+			return -ENXIO;
+		dpa_range = (struct range) {
+			.start = cxled->dpa_res->start,
+			.end = cxled->dpa_res->end,
+		};
+	}
+
+	/*
+	 * Realizing a group goes through mds->dc_chain.group, shared with the
+	 * event path, so hold its lock.  Stage into a private list so an event
+	 * chain the device left open is not consumed as existing extents.
+	 */
+	guard(mutex)(&mds->dc_chain.lock);
+
+	rc = cxl_read_extent_list(mds, &dpa_range, &existing);
+
+	/*
+	 * Already accepted on the device: no Add response is sent for existing
+	 * extents, and one that fails validation or online is released back to
+	 * the device rather than dropped.
+	 */
+	if (!rc && !list_empty(&existing))
+		rc = cxl_add_pending(mds, &existing, true);
+	drop_extent_group(&existing);
+
+	return rc;
+}
+
+#define CXL_READ_EXTENT_LIST_RETRY 10
+
+/**
+ * cxl_process_extent_list() - Read existing extents
+ * @cxled: Endpoint decoder which is part of a region
+ *
+ * Issue the Get Dynamic Capacity Extent List command to the device
+ * and add existing extents if found.
+ *
+ * A retry of 10 is somewhat arbitrary, however, extent changes should be
+ * relatively rare while bringing up a region.  So 10 should be plenty.
+ */
+int cxl_process_extent_list(struct cxl_endpoint_decoder *cxled)
+{
+	int retry = CXL_READ_EXTENT_LIST_RETRY;
+	int rc;
+
+	do {
+		rc = __cxl_process_extent_list(cxled);
+	} while (rc == -EAGAIN && --retry);
+
+	return rc;
+}
 
 int cxl_get_dirty_count(struct cxl_memdev_state *mds, u32 *count)
 {
