@@ -608,6 +608,8 @@ struct cxl_dax_region {
 	struct ida tag_group_ida;
 	/* The region's single endpoint decoder: DC regions are not interleaved */
 	struct cxl_endpoint_decoder *cxled;
+	/* Set once the probe has read the device's pre-existing extents. */
+	bool extents_scanned;
 };
 
 /**
@@ -998,6 +1000,9 @@ bool is_cxl_pmem_region(struct device *dev);
 struct cxl_pmem_region *to_cxl_pmem_region(struct device *dev);
 int cxl_add_to_region(struct cxl_endpoint_decoder *cxled);
 struct cxl_dax_region *to_cxl_dax_region(struct device *dev);
+int cxl_region_add_existing_extents(struct cxl_dax_region *cxlr_dax);
+void cxl_region_reset_extent_scan(struct cxl_dax_region *cxlr_dax);
+void cxl_dax_region_release_groups(struct cxl_dax_region *cxlr_dax);
 bool cxl_region_contains_resource(const struct resource *res);
 #else
 static inline bool is_cxl_pmem_region(struct device *dev)
@@ -1016,6 +1021,23 @@ static inline struct cxl_dax_region *to_cxl_dax_region(struct device *dev)
 {
 	return NULL;
 }
+
+static inline int
+cxl_region_add_existing_extents(struct cxl_dax_region *cxlr_dax)
+{
+	return 0;
+}
+
+static inline void
+cxl_region_reset_extent_scan(struct cxl_dax_region *cxlr_dax)
+{
+}
+
+static inline void
+cxl_dax_region_release_groups(struct cxl_dax_region *cxlr_dax)
+{
+}
+
 static inline bool cxl_region_contains_resource(const struct resource *res)
 {
 	return false;

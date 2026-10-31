@@ -109,6 +109,7 @@ static void cxlr_dax_unregister(void *_cxlr_dax)
 	cxlr_dax_unpublish(cxlr_dax);
 	/* Unbind first: the DAX devices over the groups go with the driver */
 	device_release_driver(&cxlr_dax->dev);
+	/* No group outlives its dax_region, whether a driver returned them or not */
 	cxl_dax_region_release_groups(cxlr_dax);
 	device_unregister(&cxlr_dax->dev);
 }
@@ -118,6 +119,42 @@ DEFINE_FREE(unpublish_cxl_dax_region, struct cxl_dax_region *,
 		cxlr_dax_unpublish(_T);
 		put_device(&_T->dev);
 	})
+
+/*
+ * Runs from cxl_dax_region_probe().  The region's parameters may not be
+ * read here: a concurrent detach clears p->targets[] under cxl_rwsem.region
+ * before it waits for this probe.  Use the decoder recorded at allocation
+ * instead; cxlr_dax holds a reference on it.
+ */
+int cxl_region_add_existing_extents(struct cxl_dax_region *cxlr_dax)
+{
+	struct cxl_endpoint_decoder *cxled = cxlr_dax->cxled;
+	int rc;
+
+	rc = cxl_process_extent_list(cxled);
+	if (rc) {
+		dev_err(&cxled->cxld.dev, "Existing extent processing failed %d\n",
+			rc);
+		return rc;
+	}
+
+	/* Pairs with the acquire in cxl_validate_extent(); adds may proceed */
+	smp_store_release(&cxlr_dax->extents_scanned, true);
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_region_add_existing_extents, "CXL");
+
+/*
+ * Driver unbind returns the held extents to the device (devres), so refuse
+ * new adds until the next probe has read the device's list again.
+ */
+void cxl_region_reset_extent_scan(struct cxl_dax_region *cxlr_dax)
+{
+	/* Adds test the gate under cxl_rwsem.region; none is mid-flight after this */
+	guard(rwsem_write)(&cxl_rwsem.region);
+	cxlr_dax->extents_scanned = false;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_region_reset_extent_scan, "CXL");
 
 int devm_cxl_add_dax_region(struct cxl_region *cxlr)
 {
