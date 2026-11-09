@@ -23,6 +23,7 @@ static char *directions[] = {
 static char *mode[] = {
 	"SINGLE_MODE",
 	"SG_MODE",
+	"IOVA_MODE",
 };
 
 int main(int argc, char **argv)
@@ -72,8 +73,9 @@ int main(int argc, char **argv)
 	}
 
 	if (map_mode < 0 || map_mode >= DMA_MAP_BENCH_MODE_MAX) {
-		fprintf(stderr, "invalid map mode, SINGLE_MODE:%d, SG_MODE: %d\n",
-			DMA_MAP_BENCH_SINGLE_MODE, DMA_MAP_BENCH_SG_MODE);
+		fprintf(stderr, "invalid map mode, SINGLE_MODE:%d, SG_MODE:%d, IOVA_MODE:%d\n",
+			DMA_MAP_BENCH_SINGLE_MODE, DMA_MAP_BENCH_SG_MODE,
+			DMA_MAP_BENCH_IOVA_MODE);
 		exit(1);
 	}
 
