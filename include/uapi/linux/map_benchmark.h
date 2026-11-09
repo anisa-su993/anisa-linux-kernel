@@ -20,6 +20,7 @@
 enum {
 	DMA_MAP_BENCH_SINGLE_MODE,
 	DMA_MAP_BENCH_SG_MODE,
+	DMA_MAP_BENCH_IOVA_MODE,
 	DMA_MAP_BENCH_MODE_MAX
 };
 
@@ -36,6 +37,7 @@ struct map_benchmark {
 	__u32 dma_trans_ns; /* time for DMA transmission in ns */
 	__u32 granule;  /* - SINGLE_MODE: number of pages mapped/unmapped per operation
 			 * - SG_MODE: number of scatterlist entries (each maps one page)
+			 * - IOVA_MODE: number of pages linked into one IOVA range
 			 */
 	__u8 map_mode;  /* the mode of dma map */
 	__u8 expansion[75]; /* For future use */

@@ -227,9 +227,128 @@ static struct map_benchmark_ops dma_sg_map_benchmark_ops = {
 	.do_unmap = dma_sg_map_benchmark_do_unmap,
 };
 
+struct dma_iova_map_param {
+	struct dma_iova_state state;
+	struct device *dev;
+	u32 npages;
+	u32 dma_dir;
+	void *buf[] __counted_by(npages);
+};
+
+static void *dma_iova_map_benchmark_prepare(struct map_benchmark_data *map)
+{
+	struct dma_iova_map_param *params;
+	u32 npages;
+	int i;
+
+	/* In IOVA mode, 'granule' is the number of pages linked into one IOVA range. */
+	npages = map->bparam.granule;
+
+	params = kzalloc_flex(*params, buf, npages);
+	if (!params)
+		return NULL;
+
+	params->npages = npages;
+	params->dma_dir = map->bparam.dma_dir;
+	params->dev = map->dev;
+
+	for (i = 0; i < npages; i++) {
+		params->buf[i] = (void *)__get_free_page(GFP_KERNEL);
+		if (!params->buf[i])
+			goto free_page;
+	}
+
+	return params;
+
+free_page:
+	while (i-- > 0)
+		free_page((unsigned long)params->buf[i]);
+
+	kfree(params);
+	return NULL;
+}
+
+static void dma_iova_map_benchmark_unprepare(void *mparam)
+{
+	struct dma_iova_map_param *params = mparam;
+	int i;
+
+	for (i = 0; i < params->npages; i++)
+		free_page((unsigned long)params->buf[i]);
+
+	kfree(params);
+}
+
+static void dma_iova_map_benchmark_initialize_data(void *mparam)
+{
+	struct dma_iova_map_param *params = mparam;
+	int i;
+
+	if (params->dma_dir == DMA_FROM_DEVICE)
+		return;
+
+	for (i = 0; i < params->npages; i++)
+		memset(params->buf[i], 0x66, PAGE_SIZE);
+}
+
+static int dma_iova_map_benchmark_do_map(void *mparam)
+{
+	struct dma_iova_map_param *params = mparam;
+	size_t mapped = 0;
+	int i, ret;
+
+	if (!dma_iova_try_alloc(params->dev, &params->state,
+				virt_to_phys(params->buf[0]),
+				params->npages * PAGE_SIZE)) {
+		pr_err("dma_iova_try_alloc failed on %s\n", dev_name(params->dev));
+		return -EOPNOTSUPP;
+	}
+
+	/* Page-aligned pages always satisfy the dma_iova_link() merge boundary. */
+	for (i = 0; i < params->npages; i++) {
+		ret = dma_iova_link(params->dev, &params->state,
+				    virt_to_phys(params->buf[i]), mapped,
+				    PAGE_SIZE, params->dma_dir, 0);
+		if (ret) {
+			pr_err("dma_iova_link failed on %s\n", dev_name(params->dev));
+			goto destroy;
+		}
+		mapped += PAGE_SIZE;
+	}
+
+	ret = dma_iova_sync(params->dev, &params->state, 0, mapped);
+	if (ret) {
+		pr_err("dma_iova_sync failed on %s\n", dev_name(params->dev));
+		goto destroy;
+	}
+
+	return 0;
+
+destroy:
+	dma_iova_destroy(params->dev, &params->state, mapped, params->dma_dir, 0);
+	return ret;
+}
+
+static void dma_iova_map_benchmark_do_unmap(void *mparam)
+{
+	struct dma_iova_map_param *params = mparam;
+
+	dma_iova_destroy(params->dev, &params->state,
+			 params->npages * PAGE_SIZE, params->dma_dir, 0);
+}
+
+static struct map_benchmark_ops dma_iova_map_benchmark_ops = {
+	.prepare = dma_iova_map_benchmark_prepare,
+	.unprepare = dma_iova_map_benchmark_unprepare,
+	.initialize_data = dma_iova_map_benchmark_initialize_data,
+	.do_map = dma_iova_map_benchmark_do_map,
+	.do_unmap = dma_iova_map_benchmark_do_unmap,
+};
+
 static struct map_benchmark_ops *dma_map_benchmark_ops[DMA_MAP_BENCH_MODE_MAX] = {
 	[DMA_MAP_BENCH_SINGLE_MODE] = &dma_single_map_benchmark_ops,
 	[DMA_MAP_BENCH_SG_MODE] = &dma_sg_map_benchmark_ops,
+	[DMA_MAP_BENCH_IOVA_MODE] = &dma_iova_map_benchmark_ops,
 };
 
 static int map_benchmark_thread(void *data)
