@@ -637,6 +637,8 @@ struct cxl_dax_region {
  *		for how seq_num is sourced for sharable vs non-sharable
  *		allocations.
  * @nr_extents: number of member dc_extents
+ * @size: total length of the member dc_extents; fixed, like @nr_extents,
+ *	  once the group is built
  * @pending_online: built, awaiting the Add response; on the memdev's
  *		    dc_chain.tag_groups list
  * @node: anchor on the host-wide list of online groups, from
@@ -648,6 +650,7 @@ struct cxl_dc_tag_group {
 	uuid_t uuid;
 	struct xarray dc_extents;
 	unsigned int nr_extents;
+	u64 size;
 	struct list_head pending_online;
 	struct list_head node;
 };
