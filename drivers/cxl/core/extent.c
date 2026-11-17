@@ -10,14 +10,36 @@
  * Host-wide list of online tag groups.  An add checks it for capacity the
  * host already holds and a region's teardown drains its groups from it; a
  * group is on it from online until rm_tag_group(), whatever the state of
- * the region's own pointers.
+ * the region's own pointers.  A non-null tag appears on it once: a tag
+ * uuid names one allocation across all regions and memdevs.
  */
 static DEFINE_MUTEX(cxl_dc_group_lock);
 static LIST_HEAD(cxl_dc_groups);
 
+/* The orchestrator owns tag allocation; a repeated tag is a firmware bug */
+static bool tag_online(const uuid_t *uuid)
+{
+	struct cxl_dc_tag_group *g;
+
+	lockdep_assert_held(&cxl_dc_group_lock);
+
+	if (uuid_is_null(uuid))
+		return false;
+	list_for_each_entry(g, &cxl_dc_groups, node)
+		if (uuid_equal(&g->uuid, uuid))
+			return true;
+	return false;
+}
+
 static int register_tag_group(struct cxl_dc_tag_group *group)
 {
 	guard(mutex)(&cxl_dc_group_lock);
+	if (tag_online(&group->uuid)) {
+		dev_warn_ratelimited(&group->cxlr_dax->dev,
+				     "Tag %pUb already online on this host (firmware/orchestrator bug)\n",
+				     &group->uuid);
+		return -EBUSY;
+	}
 	list_add_tail(&group->node, &cxl_dc_groups);
 	return 0;
 }
